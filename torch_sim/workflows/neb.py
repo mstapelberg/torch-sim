@@ -36,16 +36,15 @@ class NEB:
     the NEB algorithm.
 
     Attributes:
-        model (ModelInterface): The energy/force model (e.g., MACE) wrapped in a
-            ModelInterface.
-        n_images (int): Number of intermediate images between initial and final states.
-        spring_constant (float): Spring constant connecting adjacent images.
-        use_climbing_image (bool): Whether to use a climbing image.
-        optimizer_type: Literal["fire", "gd", "frechet_cell_fire"]: Type of optimizer to use.
-        optimizer_params: dict[str, Any]: Parameters for the optimizer.
-        trajectory_filename (str | None): Filename for saving the trajectory.
-        device (torch.device): Computation device.
-        dtype (torch.dtype): Computation data type.
+        model: The energy/force model (e.g., MACE) wrapped in a ModelInterface.
+        n_images: Number of intermediate images between initial and final states.
+        spring_constant: Spring constant connecting adjacent images (eV/Ang^2).
+        use_climbing_image: Whether to use a climbing image.
+        optimizer_type: Type of optimizer to use.
+        optimizer_params: Parameters for the chosen optimizer.
+        trajectory_filename: Optional filename for saving the NEB trajectory.
+        device: Computation device (e.g., 'cpu', 'cuda'). If None, uses model device.
+        dtype: Computation data type (e.g., torch.float32). If None, uses model dtype.
     """
 
     model: ModelInterface
@@ -59,7 +58,7 @@ class NEB:
     dtype: torch.dtype | None = None
 
     def __post_init__(self):
-        """Initialize derived attributes."""
+        """Initializes device, dtype, and optimizer functions after dataclass creation."""
         if self.device is None:
             self.device = self.model.device
         if self.dtype is None:
@@ -85,18 +84,25 @@ class NEB:
             raise ValueError(f"Unsupported optimizer_type: {self.optimizer_type}")
 
     def _interpolate_path(self, initial_state: SimState, final_state: SimState) -> SimState:
-        """Linearly interpolate the initial path between states.
+        """Linearly interpolate the initial path between states using MIC.
+
+        Generates `n_images` intermediate states between the initial and final states
+        by linear interpolation of atomic positions, respecting periodic boundary
+        conditions via the Minimum Image Convention (MIC).
 
         Args:
-            initial_state: The starting SimState (single batch).
-            final_state: The ending SimState (single batch).
+            initial_state (SimState): The starting SimState (must be single-batch).
+            final_state (SimState): The ending SimState (must be single-batch).
 
         Returns:
-            SimState: A single SimState containing all interpolated images, batched.
+            SimState: A single SimState containing all interpolated intermediate
+                images, batched together. The batch index corresponds to the image
+                index (0 to n_images-1).
 
         Raises:
             ValueError: If initial and final states are incompatible (e.g., different
-                number of atoms, atom types, pbc, or multiple batches).
+                number of atoms, atom types, PBC settings, or if they are not
+                single-batch states).
         """
         # --- Input Validation ---
         if initial_state.n_batches != 1 or final_state.n_batches != 1:
@@ -121,10 +127,6 @@ class NEB:
         # --- Interpolation ---
         initial_pos = initial_state.positions
         final_pos = final_state.positions
-
-        # Calculate displacement (simple subtraction, ignoring MIC for now)
-        # TODO: Consider using MIC for displacement calculation if needed.
-        # displacement = final_pos - initial_pos # Old simple subtraction
 
         # Calculate displacement using Minimum Image Convention
         displacement = minimum_image_displacement(
@@ -177,16 +179,23 @@ class NEB:
     ) -> torch.Tensor:
         """Compute normalized tangent vectors for intermediate NEB images.
 
-        Implements the improved tangent estimate of Henkelman and Jónsson (2000).
+        Implements the improved tangent estimate of Henkelman and Jónsson (2000)
+        to determine the local tangent direction at each intermediate image based
+        on the positions and energies of its neighbors.
 
         Args:
-            all_pos: Atomic configurations for all images (initial + intermediate + final).
-            all_energies: Energy of each image.
-            cell: Unit cell vectors.
-            pbc: Periodic boundary conditions flag.
+            all_pos (torch.Tensor): Atomic configurations for all images in the path
+                (initial + intermediate + final), shape [n_total_images, n_atoms, 3].
+            all_energies (torch.Tensor): Potential energy of each image, shape
+                [n_total_images].
+            cell (torch.Tensor): Unit cell vectors (shape [3, 3]), assumed constant
+                for the path.
+            pbc (bool): Flag indicating if periodic boundary conditions are active.
 
         Returns:
-            Local tangent vectors for intermediate images [n_images, n_atoms, 3], normalized.
+            torch.Tensor: Normalized local tangent vectors for the intermediate
+                images only, shape [n_images, n_atoms, 3]. Tangents are zero for
+                numerically identical adjacent images.
         """
         n_total_images, n_atoms_per_image, _ = all_pos.shape
         n_intermediate_images = n_total_images - 2
@@ -295,21 +304,28 @@ class NEB:
         final_energy: torch.Tensor,
         step: int,
     ) -> torch.Tensor:
-        """Calculate the NEB forces (true force perpendicular + spring force parallel).
+        """Calculate the NEB forces for intermediate images.
+
+        The NEB force is composed of the true force perpendicular to the path tangent
+        and the spring force parallel to the path tangent. Handles climbing image
+        force modification if enabled.
 
         Args:
-            path_state: SimState containing the full path (initial + intermediate + final).
-                        Assumes batches are ordered 0=initial, 1..n=intermediate, n+1=final.
-            true_forces: Tensor of shape [n_movable_atoms, 3] containing the forces from
-                         the potential energy model for the *intermediate* images only.
-            true_energies: Tensor of shape [n_images] containing the potential energies
-                           for the *intermediate* images only.
-            initial_energy: Potential energy of the initial state (scalar tensor).
-            final_energy: Potential energy of the final state (scalar tensor).
-            step: Current optimization step.
+            path_state (SimState): SimState containing the full path (initial +
+                intermediate + final images). Batches are assumed to be ordered.
+            true_forces (torch.Tensor): Forces from the potential energy model for
+                the *intermediate* images only, shape [n_movable_atoms, 3].
+            true_energies (torch.Tensor): Potential energies for the *intermediate*
+                images only, shape [n_images].
+            initial_energy (torch.Tensor): Potential energy of the initial state
+                (scalar tensor).
+            final_energy (torch.Tensor): Potential energy of the final state
+                (scalar tensor).
+            step (int): Current optimization step number (used for climbing image delay).
 
         Returns:
-            Tensor: NEB forces for the intermediate images, shape [n_movable_atoms, 3].
+            torch.Tensor: Calculated NEB forces for the intermediate images, ready to
+                be passed to the optimizer, shape [n_movable_atoms, 3].
         """
         n_total_images = path_state.n_batches
         n_intermediate_images = n_total_images - 2
@@ -402,16 +418,22 @@ class NEB:
         fmax: float = 0.05,
         # TODO: add convergence criteria, batching options, output frequency etc.
     ) -> SimState:  # Or maybe return trajectory?
-        """Run the NEB optimization.
+        """Run the Nudged Elastic Band optimization.
+
+        Optimizes the path between the initial and final systems to find the
+        Minimum Energy Path (MEP).
 
         Args:
-            initial_system: The starting configuration (ASE Atoms, SimState, etc.).
-            final_system: The ending configuration.
-            max_steps: Maximum number of optimization steps.
-            fmax: Convergence criterion for the maximum NEB force per atom (eV/Ang).
+            initial_system (StateLike): The starting configuration (can be ASE Atoms,
+                SimState, or other compatible format recognized by initialize_state).
+            final_system (StateLike): The ending configuration.
+            max_steps (int): Maximum number of optimization steps allowed.
+            fmax (float): Convergence criterion based on the maximum NEB force component
+                acting on any single atom across all intermediate images (in eV/Ang).
 
         Returns:
-            The optimized NEB path (SimState containing all images).
+            SimState: The final optimized NEB path, including the initial,
+                intermediate, and final images, concatenated into a single SimState.
         """
         logger.info("Starting NEB optimization")
 
