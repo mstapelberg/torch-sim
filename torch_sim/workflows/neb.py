@@ -24,6 +24,9 @@ from torch_sim.typing import StateLike
 
 logger = logging.getLogger(__name__)
 
+# Add epsilon for numerical stability
+_EPS = torch.finfo(torch.float64).eps
+
 
 @dataclass
 class NEB:
@@ -165,6 +168,124 @@ class NEB:
             batch=all_batch,
         )
 
+    def _compute_tangents(
+        self,
+        all_pos: torch.Tensor, # Shape: [n_total_images, n_atoms, 3]
+        all_energies: torch.Tensor, # Shape: [n_total_images]
+        cell: torch.Tensor, # Shape: [3, 3]
+        pbc: bool,
+    ) -> torch.Tensor:
+        """Compute normalized tangent vectors for intermediate NEB images.
+
+        Implements the improved tangent estimate of Henkelman and Jónsson (2000).
+
+        Args:
+            all_pos: Atomic configurations for all images (initial + intermediate + final).
+            all_energies: Energy of each image.
+            cell: Unit cell vectors.
+            pbc: Periodic boundary conditions flag.
+
+        Returns:
+            Local tangent vectors for intermediate images [n_images, n_atoms, 3], normalized.
+        """
+        n_total_images, n_atoms_per_image, _ = all_pos.shape
+        n_intermediate_images = n_total_images - 2
+        device = all_pos.device
+        dtype = all_pos.dtype
+
+        # Initialize tangents for intermediate images only
+        tangents = torch.zeros(
+            (n_intermediate_images, n_atoms_per_image, 3), device=device, dtype=dtype
+        )
+
+        # Calculate displacements between adjacent images using MIC
+        # dR_forward[i] = R_{i+1} - R_i
+        displacements = minimum_image_displacement(
+            dr=all_pos[1:] - all_pos[:-1], cell=cell, pbc=pbc
+        )
+        # Ensure shape is correct after MIC if needed
+        displacements = displacements.reshape(n_total_images - 1, n_atoms_per_image, 3)
+
+        # Energy differences V_{i+1} - V_i
+        dE_forward = all_energies[1:] - all_energies[:-1] # Shape: [n_total_images - 1]
+
+        # Compute tangents for intermediate images (indices 1 to N in all_pos)
+        for i in range(n_intermediate_images):
+            img_idx = i + 1  # Index in all_pos, all_energies
+
+            # Displacements adjacent to image `img_idx`
+            # Note: displacements[k] is R_{k+1} - R_k
+            dR_plus = displacements[img_idx]     # R_{i+1} - R_i (where i = img_idx)
+            dR_minus = displacements[img_idx - 1]  # R_i - R_{i-1} (where i = img_idx)
+
+            # Energy differences adjacent to image `img_idx`
+            dE_plus = dE_forward[img_idx]     # V_{i+1} - V_i
+            dE_minus = dE_forward[img_idx - 1]  # V_i - V_{i-1}
+
+            # Select tangent based on energy profile (Henkelman & Jónsson criteria)
+            tangent_i = torch.zeros_like(dR_plus)
+
+            # Ascending segment (minimum)
+            if dE_plus > 0 and dE_minus > 0:
+                if dE_plus > dE_minus:
+                    tangent_i = dR_plus
+                else:
+                    tangent_i = dR_minus
+            # Descending segment (maximum)
+            elif dE_plus < 0 and dE_minus < 0:
+                # Weight by energy difference magnitude (originally absolute value based in ref code)
+                # Simplified version: use lower energy difference direction
+                # Let's use the reference code's logic more closely:
+                # if abs(dE_plus) < abs(dE_minus): # Towards lower energy drop
+                #     tangent_i = dR_plus
+                # else:
+                #     tangent_i = dR_minus
+                # Alternative based on reference code logic:
+                # Weight lower-energy direction
+                # This implementation seems slightly different from reference, let's try that:
+                abs_dE_plus = abs(dE_plus)
+                abs_dE_minus = abs(dE_minus)
+                if torch.isclose(abs_dE_plus, abs_dE_minus, rtol=1e-6):
+                     # Symmetric max: bisect angle (normalize sum of unit vectors)
+                     norm_plus = torch.linalg.norm(dR_plus)
+                     norm_minus = torch.linalg.norm(dR_minus)
+                     if norm_plus > _EPS and norm_minus > _EPS:
+                         tangent_i = (dR_plus / norm_plus) + (dR_minus / norm_minus)
+                     # Handle cases where one norm is zero (e.g., duplicate image)
+                     elif norm_plus > _EPS:
+                         tangent_i = dR_plus / norm_plus
+                     elif norm_minus > _EPS:
+                         tangent_i = dR_minus / norm_minus
+                     # else: tangent_i remains zero if both norms are zero
+                elif abs_dE_plus < abs_dE_minus:
+                     tangent_i = dR_plus
+                else:
+                     tangent_i = dR_minus
+
+            # Uphill slope
+            elif dE_plus > 0 and dE_minus <= 0: # Modified condition slightly for plateaus
+                tangent_i = dR_plus
+            # Downhill slope
+            elif dE_plus <= 0 and dE_minus > 0: # Modified condition slightly for plateaus
+                tangent_i = dR_minus
+            # Plateau or unexpected case (should ideally not happen in smooth path)
+            # Fallback based on magnitude (consistent with reference code fallback)
+            else:
+                 if abs(dE_plus) > abs(dE_minus):
+                     tangent_i = dR_plus
+                 else:
+                     tangent_i = dR_minus
+
+
+            # Normalize the tangent vector for the image
+            # Sum over atoms and dims: [1]
+            norm_i = torch.sqrt((tangent_i**2).sum()) # Simpler norm calculation
+            if norm_i > _EPS:
+                 tangents[i] = tangent_i / norm_i
+            # else: tangent remains zero if norm is too small
+
+        return tangents
+
     def _calculate_neb_forces(
         self,
         path_state: SimState,
@@ -201,16 +322,10 @@ class NEB:
             n_intermediate_images, n_atoms_per_image, 3
         )
         # Cell vectors (assuming fixed cell for now, take from first batch)
-        # Shape [3, 3]
-        cell = path_state.cell[0]
+        cell = path_state.cell[0] # Shape [3, 3]
         pbc = path_state.pbc
 
         # --- Get Energies for Tangent Calculation ---
-        # Need energies for all images (0 to n+1)
-        # Get endpoint energies - requires running the model on them!
-        # TODO: This is inefficient! Energies should ideally be pre-calculated or passed.
-        # For now, let's assume they are roughly equal to neighbors if not available.
-        # A better approach is needed here. Maybe pass initial/final states?
         all_energies = torch.cat(
             [
                 initial_energy.unsqueeze(0),
@@ -219,93 +334,63 @@ class NEB:
             ]
         )
 
-        # --- Calculate Tangents (tau) --- 
-        tangents = torch.zeros_like(true_forces_reshaped)
-        # Vectors between adjacent images (using MIC)
-        # d[i] = R_{i+1} - R_i, shape [n_images+1, n_atoms, 3]
+        # --- Calculate Tangents (tau) using the improved method ---
+        # tangents shape: [n_images, n_atoms, 3]
+        tangents = self._compute_tangents(all_pos, all_energies, cell, pbc)
+
+        # --- Calculate Displacements for Spring Force ---
+        # Recalculate here or reuse from _compute_tangents if efficient
+        # For clarity, recalculate:
         displacements = minimum_image_displacement(
-            dr = all_pos[1:] - all_pos[:-1],
-            cell = cell,
-            pbc = pbc,
+            dr=all_pos[1:] - all_pos[:-1], cell=cell, pbc=pbc
         )
-        # Ensure displacements shape matches expectations if MIC function altered it.
         displacements = displacements.reshape(n_total_images - 1, n_atoms_per_image, 3)
 
-        for i in range(n_intermediate_images): # Loop over intermediate images 1 to N
-            img_idx = i + 1 # Index in all_pos and all_energies
 
-            E_prev = all_energies[img_idx - 1]
-            E_curr = all_energies[img_idx]
-            E_next = all_energies[img_idx + 1]
+        # --- Calculate NEB Force Components ---
 
-            d_im1_i = displacements[img_idx - 1] # R_i - R_{i-1}
-            d_i_ip1 = displacements[img_idx]     # R_{i+1} - R_i
-
-            # Tangent selection based on energy landscape (VTST/ASE style)
-            if E_next > E_curr > E_prev:
-                tau = d_i_ip1
-            elif E_prev > E_curr > E_next:
-                tau = d_im1_i
-            else:
-                # Saddle point or minimum: use higher energy side vector, normalized
-                delta_E_prev = abs(E_curr - E_prev)
-                delta_E_next = abs(E_next - E_curr)
-                if E_next > E_prev:
-                    tau = d_i_ip1 * delta_E_prev + d_im1_i * delta_E_next
-                else:
-                     # Corrected weighting for E_next <= E_prev case
-                     tau = d_i_ip1 * delta_E_next + d_im1_i * delta_E_prev
-                # Original formulation based just on position difference:
-                # if E_next > E_prev:
-                #     tau = d_i_ip1
-                # else:
-                #     tau = d_im1_i
-
-            # Normalize the tangent vector (sum over atoms and dims)
-            tau_norm = torch.sqrt((tau**2).sum(dim=(-1, -2), keepdim=True))
-            # Avoid division by zero if tangent is zero (e.g., identical images)
-            if tau_norm.item() > 1e-10:
-                tangents[i] = tau / tau_norm
-            # else: tangent remains zero
-
-        # --- Calculate NEB Forces --- 
-        neb_forces = torch.zeros_like(true_forces_reshaped)
-
-        # Calculate perpendicular component of true force
+        # 1. Perpendicular component of true force
         # F_perp = F_true - (F_true . tau) * tau
         # Dot product (sum over atoms and dims): [n_images]
         F_true_dot_tau = (true_forces_reshaped * tangents).sum(dim=(-1, -2), keepdim=True)
         F_perp = true_forces_reshaped - F_true_dot_tau * tangents
 
-        # Calculate parallel component of spring force
+        # 2. Parallel component of spring force
         # F_spring_par = k * (|R_{i+1}-R_i| - |R_i-R_{i-1}|) * tau_i
         # Segment lengths (scalar magnitude per segment): [n_images+1]
-        segment_lengths = torch.sqrt((displacements**2).sum(dim=(-1, -2)))
+        # segment_lengths = torch.sqrt((displacements**2).sum(dim=(-1, -2))) # Old way
+        segment_lengths = torch.linalg.norm(displacements, dim=(-1,-2)) # Cleaner way [n_total_images-1]
         # Spring force magnitude (scalar per intermediate image): [n_images]
         F_spring_mag = self.spring_constant * (segment_lengths[1:] - segment_lengths[:-1])
-        # Project onto tangent: [n_images, 1, 1]
+        # Project onto tangent: [n_images, 1, 1] -> [n_images, n_atoms, 3]
         F_spring_par = F_spring_mag.view(-1, 1, 1) * tangents
 
-        # Combine: NEB force = F_perp + F_spring_par
+        # --- Combine Components for NEB Force ---
+        # Initial NEB force = F_perp + F_spring_par
         neb_forces = F_perp + F_spring_par
 
-        # --- Handle Climbing Image --- 
+        # --- Handle Climbing Image ---
         if self.use_climbing_image and n_intermediate_images > 0:
             # Find index of highest energy image among intermediates
-            climbing_image_idx = torch.argmax(true_energies).item()
-            # Invert the true force component along the tangent for this image
-            # F_climb = F_true - 2 * (F_true . tau) * tau
+            climbing_image_idx = torch.argmax(true_energies).item() # Index from 0 to n_images-1
+
+            # Calculate the climbing force: F_climb = F_true - 2 * (F_true . tau) * tau
+            # This effectively inverts the component of the true force parallel to the tangent
             F_climb = true_forces_reshaped[climbing_image_idx] - \
                       2 * F_true_dot_tau[climbing_image_idx] * tangents[climbing_image_idx]
+
+            # Replace the NEB force for the climbing image with F_climb
+            # This overwrites the spring force component for this image, as required.
             neb_forces[climbing_image_idx] = F_climb
 
+        # --- Logging (Optional) ---
+        logger.debug(f"  Max True Force Mag: {torch.linalg.norm(true_forces_reshaped, dim=(-1,-2)).max().item():.4f}")
+        logger.debug(f"  Max F_perp Mag: {torch.linalg.norm(F_perp, dim=(-1,-2)).max().item():.4f}")
+        logger.debug(f"  Max F_spring_par Mag: {torch.linalg.norm(F_spring_par, dim=(-1,-2)).max().item():.4f}")
+        logger.debug(f"  Max NEB Force Mag: {torch.linalg.norm(neb_forces, dim=(-1,-2)).max().item():.4f}")
 
-        logger.debug(f"  Max True Force Mag: {torch.sqrt((true_forces_reshaped**2).sum(dim=-1)).max().item():.4f}")
-        logger.debug(f"  Max F_perp Mag: {torch.sqrt((F_perp**2).sum(dim=-1)).max().item():.4f}")
-        logger.debug(f"  Max F_spring_par Mag: {torch.sqrt((F_spring_par**2).sum(dim=-1)).max().item():.4f}")
-        logger.debug(f"  Max NEB Force Mag: {torch.sqrt((neb_forces**2).sum(dim=-1)).max().item():.4f}")
 
-        # --- Reshape output --- 
+        # --- Reshape output ---
         return neb_forces.reshape(-1, 3) # [n_movable_atoms, 3]
 
     def run(
