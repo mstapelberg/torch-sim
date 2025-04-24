@@ -50,7 +50,7 @@ class NEB:
 
     model: ModelInterface
     n_images: int
-    spring_constant: float = 5.0  # eV/Ang^2, typical ASE default
+    spring_constant: float = 0.1  # eV/Ang^2, typical ASE default
     use_climbing_image: bool = False
     optimizer_type: Literal["fire", "gd", "frechet_cell_fire"] = "fire"
     optimizer_params: dict[str, Any] = field(default_factory=dict)
@@ -293,6 +293,7 @@ class NEB:
         true_energies: torch.Tensor,
         initial_energy: torch.Tensor,
         final_energy: torch.Tensor,
+        step: int,
     ) -> torch.Tensor:
         """Calculate the NEB forces (true force perpendicular + spring force parallel).
 
@@ -305,6 +306,7 @@ class NEB:
                            for the *intermediate* images only.
             initial_energy: Potential energy of the initial state (scalar tensor).
             final_energy: Potential energy of the final state (scalar tensor).
+            step: Current optimization step.
 
         Returns:
             Tensor: NEB forces for the intermediate images, shape [n_movable_atoms, 3].
@@ -370,18 +372,17 @@ class NEB:
         neb_forces = F_perp + F_spring_par
 
         # --- Handle Climbing Image ---
-        if self.use_climbing_image and n_intermediate_images > 0:
-            # Find index of highest energy image among intermediates
-            climbing_image_idx = torch.argmax(true_energies).item() # Index from 0 to n_images-1
-
-            # Calculate the climbing force: F_climb = F_true - 2 * (F_true . tau) * tau
-            # This effectively inverts the component of the true force parallel to the tangent
-            F_climb = true_forces_reshaped[climbing_image_idx] - \
-                      2 * F_true_dot_tau[climbing_image_idx] * tangents[climbing_image_idx]
-
-            # Replace the NEB force for the climbing image with F_climb
-            # This overwrites the spring force component for this image, as required.
-            neb_forces[climbing_image_idx] = F_climb
+        climbing_delay_steps = 10 # Example value
+        if self.use_climbing_image and n_intermediate_images > 0 and step >= climbing_delay_steps: # Check step number
+             # Find index of highest energy image among intermediates
+             climbing_image_idx = torch.argmax(true_energies).item() # Index from 0 to n_images-1
+             # Calculate the climbing force: F_climb = F_true - 2 * (F_true . tau) * tau
+             # This effectively inverts the component of the true force parallel to the tangent
+             F_climb = true_forces_reshaped[climbing_image_idx] - \
+                       2 * F_true_dot_tau[climbing_image_idx] * tangents[climbing_image_idx]
+             # Replace the NEB force for the climbing image with F_climb
+             # This overwrites the spring force component for this image, as required.
+             neb_forces[climbing_image_idx] = F_climb
 
         # --- Logging (Optional) ---
         logger.debug(f"  Max True Force Mag: {torch.linalg.norm(true_forces_reshaped, dim=(-1,-2)).max().item():.4f}")
@@ -456,7 +457,7 @@ class NEB:
                     [initial_state, opt_state, final_state]
                 )
                 neb_forces = self._calculate_neb_forces(
-                    full_path_state_calc, true_forces, true_energies, initial_energy, final_energy
+                    full_path_state_calc, true_forces, true_energies, initial_energy, final_energy, step=step
                 )
 
                 # c. Update the forces in the FIRE state object with NEB forces

@@ -1,6 +1,7 @@
 import torch 
 import torch_sim as ts
 import matplotlib.pyplot as plt
+import numpy as np
 from ase.io import read
 from torch_sim.models.mace import MaceModel
 from torch_sim.workflows.neb import NEB 
@@ -41,9 +42,9 @@ neb_workflow = NEB(
     spring_constant=0.1,
     n_images=5,
     use_climbing_image=True, # Turn climbing off for initial GD test
-    optimizer_type="fire", # Select Gradient Descent
-    #optimizer_params={"lr": 0.01},
-    trajectory_filename="neb_path_gd.hdf5"
+    optimizer_type="gd", # Select Gradient Descent
+    optimizer_params={"lr": 0.01},
+    trajectory_filename="neb_path_gd_5im.hdf5"
 )
 
 final_path_gd = neb_workflow.run(
@@ -74,9 +75,21 @@ scaled_energies = [e - energies[0] for e in energies]
 print(scaled_energies)
 torch_sim_barrier = max(scaled_energies) - scaled_energies[0]
 ase_barrier = max(ase_energies) - ase_energies[0]
-plt.plot(scaled_energies, label='torch-sim')
-plt.plot(ase_energies, label='ASE')
-plt.xlabel('Image Coordinate')
+
+# Create normalized reaction coordinates (0 to 1) for both datasets
+torch_sim_coords = np.linspace(0, 1, len(scaled_energies))
+ase_coords = np.linspace(0, 1, len(ase_energies))
+
+# Create a common x-axis with 100 points for smoother plotting
+common_coords = np.linspace(0, 1, 100)
+
+# Interpolate both energy profiles to the common coordinate system
+torch_sim_interp = np.interp(common_coords, torch_sim_coords, scaled_energies)
+ase_interp = np.interp(common_coords, ase_coords, ase_energies)
+
+plt.plot(common_coords, torch_sim_interp, label='torch-sim')
+plt.plot(common_coords, ase_interp, label='ASE')
+plt.xlabel('Reaction Coordinate')
 plt.ylabel('Energy (eV)')
 plt.title(f'ASE Barrier = {ase_barrier:.4f} eV, torch-sim Barrier = {torch_sim_barrier:.4f} eV, Difference = {torch_sim_barrier - ase_barrier:.4f} eV')
 plt.legend()
