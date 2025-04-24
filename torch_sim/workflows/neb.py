@@ -5,16 +5,20 @@ paths between two given atomic configurations.
 """
 
 import logging
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import Any, Literal
-from contextlib import nullcontext
 
 import torch
 
-from torch_sim.autobatching import BinningAutoBatcher
 from torch_sim.models.interface import ModelInterface
 from torch_sim.optimizers import (
-    FireState, fire, GDState, gradient_descent, FrechetCellFIREState, frechet_cell_fire
+    FireState,
+    FrechetCellFIREState,
+    GDState,
+    fire,
+    frechet_cell_fire,
+    gradient_descent,
 )
 from torch_sim.state import SimState, concatenate_states, initialize_state
 from torch_sim.trajectory import TorchSimTrajectory
@@ -57,7 +61,7 @@ class NEB:
     device: torch.device | None = None
     dtype: torch.dtype | None = None
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         """Initializes device, dtype, and optimizer functions after dataclass creation."""
         if self.device is None:
             self.device = self.model.device
@@ -73,12 +77,17 @@ class NEB:
             self._init_fn, self._step_fn = fire(self.model, **self.optimizer_params)
             self._OptimizerStateType = FireState
         elif self.optimizer_type == "frechet_cell_fire":
-            # Initialize Frechet Cell FIRE, passing params. Ensure constant_volume=True is set by user.
-            self._init_fn, self._step_fn = frechet_cell_fire(self.model, **self.optimizer_params)
+            # Initialize Frechet Cell FIRE, passing params.
+            # Ensure constant_volume=True is set by user.
+            self._init_fn, self._step_fn = frechet_cell_fire(
+                self.model, **self.optimizer_params
+            )
             self._OptimizerStateType = FrechetCellFIREState
         elif self.optimizer_type == "gd":
             # Use .get() for lr with a default, in case user doesn't pass it
-            self._init_fn, self._step_fn = gradient_descent(self.model, lr=self.optimizer_params.get('lr', 0.01))
+            self._init_fn, self._step_fn = gradient_descent(
+                self.model, lr=self.optimizer_params.get("lr", 0.01)
+            )
             self._OptimizerStateType = GDState
         else:
             raise ValueError(f"Unsupported optimizer_type: {self.optimizer_type}")
@@ -120,7 +129,6 @@ class NEB:
             raise ValueError("Initial and final states must have the same PBC setting.")
         # For fixed-cell NEB, cells should ideally be identical. Warn if not?
         # if not torch.allclose(initial_state.cell, final_state.cell):
-        #     logger.warning("Initial and final states have different cell shapes.")
 
         n_atoms_per_image = initial_state.n_atoms
 
@@ -130,9 +138,9 @@ class NEB:
 
         # Calculate displacement using Minimum Image Convention
         displacement = minimum_image_displacement(
-            dr = final_pos - initial_pos,
-            cell = initial_state.cell[0], # Use cell from initial state
-            pbc = initial_state.pbc
+            dr=final_pos - initial_pos,
+            cell=initial_state.cell[0], # Use cell from initial state
+            pbc=initial_state.pbc
         )
         # Ensure shape is correct [n_atoms, 3]
         displacement = displacement.reshape(n_atoms_per_image, 3)
@@ -158,7 +166,9 @@ class NEB:
         all_cells = initial_state.cell.repeat(self.n_images, 1, 1) # Shape: [n_images, 3, 3]
 
         # Create batch tensor: [0, 0, ..., 1, 1, ..., n_images-1, ...]
-        batch_indices = torch.arange(self.n_images, device=self.device, dtype=torch.int64)
+        batch_indices = torch.arange(
+            self.n_images, device=self.device, dtype=torch.int64
+        )
         all_batch = torch.repeat_interleave(batch_indices, repeats=n_atoms_per_image)
 
         return SimState(
@@ -170,11 +180,12 @@ class NEB:
             batch=all_batch,
         )
 
-    def _compute_tangents(
+    def _compute_tangents( # noqa: C901
         self,
         all_pos: torch.Tensor, # Shape: [n_total_images, n_atoms, 3]
         all_energies: torch.Tensor, # Shape: [n_total_images]
         cell: torch.Tensor, # Shape: [3, 3]
+        *, # Make pbc keyword-only
         pbc: bool,
     ) -> torch.Tensor:
         """Compute normalized tangent vectors for intermediate NEB images.
@@ -236,10 +247,8 @@ class NEB:
 
             # Ascending segment (minimum)
             if dE_plus > 0 and dE_minus > 0:
-                if dE_plus > dE_minus:
-                    tangent_i = dR_plus
-                else:
-                    tangent_i = dR_minus
+                # Use ternary operator for simple assignment
+                tangent_i = dR_plus if dE_plus > dE_minus else dR_minus
             # Descending segment (maximum)
             elif dE_plus < 0 and dE_minus < 0:
                 # Weight by energy difference magnitude (originally absolute value based in ref code)
@@ -279,16 +288,16 @@ class NEB:
                 tangent_i = dR_minus
             # Plateau or unexpected case (should ideally not happen in smooth path)
             # Fallback based on magnitude (consistent with reference code fallback)
+            elif abs(dE_plus) > abs(dE_minus):
+                tangent_i = dR_plus
             else:
-                 if abs(dE_plus) > abs(dE_minus):
-                     tangent_i = dR_plus
-                 else:
-                     tangent_i = dR_minus
+                tangent_i = dR_minus
 
 
             # Normalize the tangent vector for the image
             # Sum over atoms and dims: [1]
-            norm_i = torch.sqrt((tangent_i**2).sum()) # Simpler norm calculation
+            # Use torch.linalg.norm for clarity and potential stability
+            norm_i = torch.linalg.norm(tangent_i)
             if norm_i > _EPS:
                  tangents[i] = tangent_i / norm_i
             # else: tangent remains zero if norm is too small
@@ -354,7 +363,7 @@ class NEB:
 
         # --- Calculate Tangents (tau) using the improved method ---
         # tangents shape: [n_images, n_atoms, 3]
-        tangents = self._compute_tangents(all_pos, all_energies, cell, pbc)
+        tangents = self._compute_tangents(all_pos, all_energies, cell, pbc=pbc)
 
         # --- Calculate Displacements for Spring Force ---
         # Recalculate here or reuse from _compute_tangents if efficient
@@ -370,16 +379,22 @@ class NEB:
         # 1. Perpendicular component of true force
         # F_perp = F_true - (F_true . tau) * tau
         # Dot product (sum over atoms and dims): [n_images]
-        F_true_dot_tau = (true_forces_reshaped * tangents).sum(dim=(-1, -2), keepdim=True)
+        F_true_dot_tau = (true_forces_reshaped * tangents).sum(
+            dim=(-1, -2), keepdim=True
+        )
         F_perp = true_forces_reshaped - F_true_dot_tau * tangents
 
         # 2. Parallel component of spring force
         # F_spring_par = k * (|R_{i+1}-R_i| - |R_i-R_{i-1}|) * tau_i
         # Segment lengths (scalar magnitude per segment): [n_images+1]
         # segment_lengths = torch.sqrt((displacements**2).sum(dim=(-1, -2))) # Old way
-        segment_lengths = torch.linalg.norm(displacements, dim=(-1,-2)) # Cleaner way [n_total_images-1]
+        segment_lengths = torch.linalg.norm(
+            displacements, dim=(-1, -2)
+        ) # Cleaner way [n_total_images-1]
         # Spring force magnitude (scalar per intermediate image): [n_images]
-        F_spring_mag = self.spring_constant * (segment_lengths[1:] - segment_lengths[:-1])
+        F_spring_mag = self.spring_constant * (
+            segment_lengths[1:] - segment_lengths[:-1]
+        )
         # Project onto tangent: [n_images, 1, 1] -> [n_images, n_atoms, 3]
         F_spring_par = F_spring_mag.view(-1, 1, 1) * tangents
 
@@ -394,17 +409,32 @@ class NEB:
              climbing_image_idx = torch.argmax(true_energies).item() # Index from 0 to n_images-1
              # Calculate the climbing force: F_climb = F_true - 2 * (F_true . tau) * tau
              # This effectively inverts the component of the true force parallel to the tangent
-             F_climb = true_forces_reshaped[climbing_image_idx] - \
-                       2 * F_true_dot_tau[climbing_image_idx] * tangents[climbing_image_idx]
+             F_climb = true_forces_reshaped[climbing_image_idx] - (
+                 2
+                 * F_true_dot_tau[climbing_image_idx]
+                 * tangents[climbing_image_idx]
+             )
              # Replace the NEB force for the climbing image with F_climb
              # This overwrites the spring force component for this image, as required.
              neb_forces[climbing_image_idx] = F_climb
 
         # --- Logging (Optional) ---
-        logger.debug(f"  Max True Force Mag: {torch.linalg.norm(true_forces_reshaped, dim=(-1,-2)).max().item():.4f}")
-        logger.debug(f"  Max F_perp Mag: {torch.linalg.norm(F_perp, dim=(-1,-2)).max().item():.4f}")
-        logger.debug(f"  Max F_spring_par Mag: {torch.linalg.norm(F_spring_par, dim=(-1,-2)).max().item():.4f}")
-        logger.debug(f"  Max NEB Force Mag: {torch.linalg.norm(neb_forces, dim=(-1,-2)).max().item():.4f}")
+        logger.debug(
+            "  Max True Force Mag: "
+            f"{torch.linalg.norm(true_forces_reshaped, dim=(-1,-2)).max().item():.4f}"
+        )
+        logger.debug(
+            "  Max F_perp Mag: "
+            f"{torch.linalg.norm(F_perp, dim=(-1,-2)).max().item():.4f}"
+        )
+        logger.debug(
+            "  Max F_spring_par Mag: "
+            f"{torch.linalg.norm(F_spring_par, dim=(-1,-2)).max().item():.4f}"
+        )
+        logger.debug(
+            "  Max NEB Force Mag: "
+            f"{torch.linalg.norm(neb_forces, dim=(-1,-2)).max().item():.4f}"
+        )
 
 
         # --- Reshape output ---
@@ -449,7 +479,9 @@ class NEB:
         endpoint_output = self.model(endpoint_states)
         initial_energy = endpoint_output["energy"][0]
         final_energy = endpoint_output["energy"][1]
-        logger.info(f"Initial Energy: {initial_energy:.4f}, Final Energy: {final_energy:.4f}")
+        logger.info(
+            f"Initial Energy: {initial_energy:.4f}, Final Energy: {final_energy:.4f}"
+        )
 
         # 2. Create initial interpolated path (movable images only)
         interpolated_images = self._interpolate_path(initial_state, final_state)
@@ -479,7 +511,12 @@ class NEB:
                     [initial_state, opt_state, final_state]
                 )
                 neb_forces = self._calculate_neb_forces(
-                    full_path_state_calc, true_forces, true_energies, initial_energy, final_energy, step=step
+                    full_path_state_calc,
+                    true_forces,
+                    true_energies,
+                    initial_energy,
+                    final_energy,
+                    step=step,
                 )
 
                 # c. Update the forces in the FIRE state object with NEB forces
@@ -488,7 +525,10 @@ class NEB:
                 # d. Perform FIRE optimization step
                 # Use the generic step function
                 opt_state = self._step_fn(opt_state)
-                logger.debug(f"  Max True Force Mag (after step): {torch.sqrt((opt_state.forces**2).sum(dim=-1)).max().item():.4f}")
+                logger.debug(
+                    "  Max True Force Mag (after step): "
+                    f"{torch.sqrt((opt_state.forces**2).sum(dim=-1)).max().item():.4f}"
+                )
 
                 # e. Write to trajectory (if enabled)
                 if self.trajectory_filename is not None: # Use explicit check
@@ -527,7 +567,6 @@ class NEB:
                 logger.warning("NEB optimization did not converge within max_steps.")
 
         # 5. Return the final path (including endpoints)
-        final_path_state = concatenate_states(
+        return concatenate_states(
             [initial_state, opt_state, final_state]
         )
-        return final_path_state 
