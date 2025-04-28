@@ -497,6 +497,44 @@ def infer_property_scope(
                     stacklevel=1,
                 )
 
+    # Special handling for GroupedSimState
+    if isinstance(state, GroupedSimState):
+        # Check the shape of the batch_group attribute directly
+        batch_group_shape = state.batch_group.shape
+        is_per_batch_shape = batch_group_shape == (state.n_batches,)
+        is_per_atom_shape = batch_group_shape == (state.n_atoms,)
+
+        if is_per_batch_shape:
+            # Correctly identified as per-batch, ensure it's in the list
+            if "batch_group" not in scope["per_batch"]:
+                scope["per_batch"].append("batch_group")
+            # Remove from other scopes if somehow misclassified earlier
+            if "batch_group" in scope["global"]:
+                scope["global"].remove("batch_group")
+            if "batch_group" in scope["per_atom"]:
+                 scope["per_atom"].remove("batch_group")
+        elif is_per_atom_shape or not is_per_batch_shape:
+            # Shape is ambiguous or per-atom
+            if ambiguous_handling == "error":
+                 raise ValueError(
+                     f"Ambiguous shape for 'batch_group' ({batch_group_shape}). Expected per-batch scope ({(state.n_batches,)})."
+                 )
+            else:  # globalize or globalize_warn
+                if ambiguous_handling == "globalize_warn":
+                     warnings.warn(
+                         f"Property 'batch_group' has ambiguous shape {batch_group_shape}, "
+                         "treating as global, but expected per-batch. Check state construction.",
+                         stacklevel=1,
+                     )
+                # Ensure it's treated as global
+                if "batch_group" not in scope["global"]:
+                     scope["global"].append("batch_group")
+                 # Remove from other scopes
+                if "batch_group" in scope["per_batch"]:
+                     scope["per_batch"].remove("batch_group")
+                if "batch_group" in scope["per_atom"]:
+                     scope["per_atom"].remove("batch_group")
+
     return scope
 
 
@@ -594,53 +632,105 @@ def _filter_attrs_by_mask(
 
 def _split_state(
     state: SimState,
+    respect_groups: bool = False,
     ambiguous_handling: Literal["error", "globalize"] = "error",
 ) -> list[SimState]:
-    """Split a SimState into a list of states, each containing a single batch element.
+    """Split a SimState into a list of states based on batches or groups.
 
-    Divides a multi-batch state into individual single-batch states, preserving
-    appropriate properties for each batch.
+    Divides a state into individual states. If `respect_groups` is False (default),
+    each output state contains a single batch. If `respect_groups` is True and the
+    input is a `GroupedSimState`, each output state contains all batches belonging
+    to a unique group ID.
 
     Args:
-        state (SimState): The SimState to split
+        state (SimState): The SimState to split.
+        respect_groups (bool): If True and state is `GroupedSimState`, split by
+            `batch_group`. Otherwise, split by `batch`. Defaults to False.
         ambiguous_handling ("error" | "globalize"): How to handle ambiguous
-            properties. If "error", an error is raised if a property has ambiguous
-            scope. If "globalize", properties with ambiguous scope are treated as
-            global.
+            properties.
 
     Returns:
         list[SimState]: A list of SimState objects, each containing a single
-            batch element
+            batch element or a group of batches.
+
+    Raises:
+        TypeError: If `respect_groups` is True but state is not `GroupedSimState`.
+        ValueError: If splitting by group results in inconsistent group assignments.
     """
     attrs = _get_property_attrs(state, ambiguous_handling)
-    batch_sizes = torch.bincount(state.batch).tolist()
 
-    # Split per-atom attributes by batch
-    split_per_atom = {}
-    for attr_name, attr_value in attrs["per_atom"].items():
-        if attr_name == "batch":
-            continue
-        split_per_atom[attr_name] = torch.split(attr_value, batch_sizes, dim=0)
+    if not respect_groups or not isinstance(state, GroupedSimState):
+        # --- Standard Split by Batch ---
+        batch_sizes = torch.bincount(state.batch).tolist()
 
-    # Split per-batch attributes into individual elements
-    split_per_batch = {}
-    for attr_name, attr_value in attrs["per_batch"].items():
-        split_per_batch[attr_name] = torch.split(attr_value, 1, dim=0)
+        # Split per-atom attributes by batch
+        split_per_atom = {}
+        for attr_name, attr_value in attrs["per_atom"].items():
+            if attr_name == "batch":
+                continue
+            split_per_atom[attr_name] = torch.split(attr_value, batch_sizes, dim=0)
 
-    # Create a state for each batch
-    states = []
-    for i in range(state.n_batches):
-        batch_attrs = {
-            # Create a batch tensor with all zeros for this batch
-            "batch": torch.zeros(batch_sizes[i], device=state.device, dtype=torch.int64),
-            # Add the split per-atom attributes
-            **{attr_name: split_per_atom[attr_name][i] for attr_name in split_per_atom},
-            # Add the split per-batch attributes
-            **{attr_name: split_per_batch[attr_name][i] for attr_name in split_per_batch},
-            # Add the global attributes
-            **attrs["global"],
-        }
-        states.append(type(state)(**batch_attrs))
+        # Split per-batch attributes into individual elements
+        split_per_batch = {}
+        for attr_name, attr_value in attrs["per_batch"].items():
+            split_per_batch[attr_name] = torch.split(attr_value, 1, dim=0)
+
+        # Create a state for each batch
+        states = []
+        for i in range(state.n_batches):
+            batch_attrs = {
+                # Create a batch tensor with all zeros for this batch
+                "batch": torch.zeros(
+                    batch_sizes[i], device=state.device, dtype=torch.int64
+                ),
+                **{
+                    attr_name: split_per_atom[attr_name][i]
+                    for attr_name in split_per_atom
+                },
+                **{
+                    attr_name: split_per_batch[attr_name][i]
+                    for attr_name in split_per_batch
+                },
+                **attrs["global"],
+            }
+            # Handle GroupedSimState: assign group ID of the original batch
+            if isinstance(state, GroupedSimState):
+                # Original group ID for batch i, needs to be a tensor
+                batch_attrs["batch_group"] = state.batch_group[i].unsqueeze(0)
+
+            states.append(type(state)(**batch_attrs))
+
+    else: # --- Split by Group ---
+        if not isinstance(state, GroupedSimState):
+             raise TypeError("Cannot split by group: input state is not GroupedSimState.")
+
+        unique_groups, group_inverse_indices = torch.unique(
+             state.batch_group, return_inverse=True
+        )
+        n_groups = len(unique_groups)
+        states = []
+
+        for group_idx in range(n_groups):
+            # Mask for batches belonging to the current group
+            group_batch_mask = group_inverse_indices == group_idx
+            # Original indices of batches in this group
+            original_batch_indices = torch.where(group_batch_mask)[0]
+
+            # Mask for atoms belonging to the batches in this group
+            group_atom_mask = torch.isin(state.batch, original_batch_indices)
+
+            # Filter attributes for the current group
+            group_attrs = _filter_attrs_by_mask(
+                attrs, group_atom_mask, group_batch_mask
+            )
+
+            # The batch_group attribute itself needs special handling - should be scalar
+            group_attrs["batch_group"] = unique_groups[group_idx].unsqueeze(0) # Ensure it's tensor [1]
+
+            # Create the state for the group
+            # The batch indices inside the new state should be relative (0 to num_batches_in_group - 1)
+            # This is handled by _filter_attrs_by_mask remapping the 'batch' attribute.
+            states.append(type(state)(**group_attrs))
 
     return states
 
@@ -649,10 +739,14 @@ def _pop_states(
     state: SimState,
     pop_indices: list[int] | torch.Tensor,
     ambiguous_handling: Literal["error", "globalize"] = "error",
+    # Add respect_groups, although its use here is less direct
+    respect_groups: bool = False,
 ) -> tuple[SimState, list[SimState]]:
     """Pop off the states with the specified indices.
 
-    Extracts and removes the specified batch indices from the state.
+    Extracts and removes the specified batch indices from the state. If
+    `respect_groups` is True and state is `GroupedSimState`, ensures
+    popped states retain their group identity.
 
     Args:
         state (SimState): The SimState to modify
@@ -661,6 +755,8 @@ def _pop_states(
             properties. If "error", an error is raised if a property has ambiguous
             scope. If "globalize", properties with ambiguous scope are treated as
             global.
+        respect_groups (bool): If True and state is `GroupedSimState`, ensures
+            popped states retain their group identity. Defaults to False.
 
     Returns:
         tuple[SimState, list[SimState]]: A tuple containing:
@@ -695,7 +791,7 @@ def _pop_states(
 
     # Create and split the pop state
     pop_state = type(state)(**pop_attrs)
-    pop_states = _split_state(pop_state, ambiguous_handling)
+    pop_states = _split_state(pop_state, respect_groups=respect_groups, ambiguous_handling=ambiguous_handling)
 
     return keep_state, pop_states
 
@@ -704,6 +800,8 @@ def _slice_state(
     state: SimState,
     batch_indices: list[int] | torch.Tensor,
     ambiguous_handling: Literal["error", "globalize"] = "error",
+    # Add respect_groups, although its use here is less direct
+    respect_groups: bool = False,
 ) -> SimState:
     """Slice a substate from the SimState containing only the specified batch indices.
 
@@ -718,6 +816,9 @@ def _slice_state(
             properties. If "error", an error is raised if a property has ambiguous
             scope. If "globalize", properties with ambiguous scope are treated as
             global.
+        respect_groups (bool): If True and state is `GroupedSimState`, ensures
+            the sliced state retains correct group identities for the selected batches.
+            Defaults to False. (Currently mainly affects validation/consistency).
 
     Returns:
         SimState: A new SimState object containing only the specified batches
@@ -789,6 +890,15 @@ def concatenate_states(
     per_atom_props = set(first_scope["per_atom"])
     per_batch_props = set(first_scope["per_batch"])
 
+    # Handle batch_group specifically if concatenating GroupedSimStates
+    is_grouped = isinstance(first_state, GroupedSimState)
+    if is_grouped and "batch_group" not in per_batch_props:
+         warnings.warn(
+             "'batch_group' not found in per-batch properties during concatenation "
+             "of GroupedSimState. Resulting state may be inconsistent.",
+             stacklevel=1
+         )
+
     # Initialize result with global properties from first state
     concatenated = {prop: getattr(first_state, prop) for prop in global_props}
 
@@ -797,40 +907,93 @@ def concatenate_states(
     per_batch_tensors = {prop: [] for prop in per_batch_props}
     new_batch_indices = []
     batch_offset = 0
+    new_group_indices = [] # For GroupedSimState
+    group_offset = 0 # For GroupedSimState
 
     # Process all states in a single pass
-    for state in states:
+    for i, state in enumerate(states):
         # Move state to target device if needed
         if state.device != target_device:
             state = state_to_device(state, target_device)
 
+        # Check for inconsistent grouping type
+        if is_grouped != isinstance(state, GroupedSimState):
+            raise TypeError(
+                 "Cannot concatenate GroupedSimState with non-GroupedSimState."
+            )
+
         # Collect per-atom properties
         for prop in per_atom_props:
-            # if hasattr(state, prop):
+            if prop == "batch": continue # Handled separately
             per_atom_tensors[prop].append(getattr(state, prop))
 
         # Collect per-batch properties
         for prop in per_batch_props:
-            # if hasattr(state, prop):
+            if prop == "batch_group": continue # Handled separately for GroupedSimState
             per_batch_tensors[prop].append(getattr(state, prop))
 
         # Update batch indices
         num_batches = state.n_batches
-        new_indices = state.batch + batch_offset
+        # Original batch indices within the state (should be 0 to num_batches-1)
+        original_batch_in_state = state.batch
+        # Remap original atom-wise batch indices to the new global batch indices
+        new_indices = original_batch_in_state + batch_offset
         new_batch_indices.append(new_indices)
         batch_offset += num_batches
 
+        # Update group indices if applicable
+        if is_grouped:
+             # If state.n_batches > 1, it represents a group split with respect_groups=True
+             # Its batch_group should be a scalar tensor [group_id]
+             # If state.n_batches == 1, it could be a single batch split normally
+             # Check shape of batch_group to be sure
+             if state.batch_group.shape == (1,):
+                  # Assume this state represents a single group (or was split normally)
+                  # Assign a *new* unique group ID relative to the concatenated state
+                  group_ids_for_state = torch.full(
+                      (state.n_batches,), group_offset,
+                      device=target_device, dtype=state.batch_group.dtype
+                  )
+                  group_offset += 1
+             elif state.batch_group.shape == (state.n_batches,):
+                 # Assume this state already has multiple batches with potentially
+                 # multiple internal group IDs. We need to remap them.
+                 # Map internal group IDs to new global group IDs
+                 unique_internal_groups, inverse_map = torch.unique(
+                      state.batch_group, return_inverse=True
+                 )
+                 num_internal_groups = len(unique_internal_groups)
+                 group_ids_for_state = inverse_map + group_offset
+                 group_offset += num_internal_groups
+             else:
+                  raise ValueError(
+                       f"Unexpected batch_group shape {state.batch_group.shape} "
+                       f"for state with n_batches={state.n_batches} during concatenation."
+                  )
+
+             new_group_indices.append(group_ids_for_state)
+
     # Concatenate collected tensors
     for prop, tensors in per_atom_tensors.items():
-        # if tensors:
-        concatenated[prop] = torch.cat(tensors, dim=0)
+        if tensors: # Ensure list is not empty
+             concatenated[prop] = torch.cat(tensors, dim=0)
 
     for prop, tensors in per_batch_tensors.items():
-        # if tensors:
-        concatenated[prop] = torch.cat(tensors, dim=0)
+        if tensors: # Ensure list is not empty
+             concatenated[prop] = torch.cat(tensors, dim=0)
 
     # Concatenate batch indices
-    concatenated["batch"] = torch.cat(new_batch_indices)
+    if new_batch_indices:
+        concatenated["batch"] = torch.cat(new_batch_indices)
+    else: # Handle case of concatenating empty (?) or single-atom states
+        concatenated["batch"] = torch.empty(0, dtype=torch.int64, device=target_device)
+
+    # Concatenate group indices if applicable
+    if is_grouped:
+        if new_group_indices:
+             concatenated["batch_group"] = torch.cat(new_group_indices)
+        else: # Handle empty case
+             concatenated["batch_group"] = torch.empty(0, dtype=torch.int64, device=target_device)
 
     # Create a new instance of the same class
     return state_class(**concatenated)
@@ -905,3 +1068,34 @@ def initialize_state(
     system_type = f"list[{type(system[0])}]" if is_list else type(system)
 
     raise ValueError(f"Unsupported system type, {system_type}")
+
+
+@dataclass
+class GroupedSimState(SimState):
+    """Extends SimState to support grouping of batches.
+
+    Adds a `batch_group` attribute to associate batches with logical groups,
+    useful for workflows like batched NEB where multiple images belong to the
+    same path.
+
+    Attributes:
+        batch_group (torch.Tensor): Group indices corresponding to each batch,
+            shape `(n_batches,)`. Batches with the same group ID belong to the
+            same logical group.
+    """
+    batch_group: torch.Tensor
+
+    def __post_init__(self) -> None:
+        """Validate group indices after initialization."""
+        super().__post_init__() # Call parent validation first
+        if self.batch_group.shape != (self.n_batches,):
+            raise ValueError(
+                f"batch_group shape ({self.batch_group.shape}) must match n_batches "
+                f"({(self.n_batches, )})."
+            )
+        if self.batch_group.device != self.device:
+            raise ValueError(
+                f"batch_group device ({self.batch_group.device}) must match state "
+                f"device ({self.device})."
+            )
+        # TODO: Consider validating group indices (e.g., consecutive starting from 0)?
