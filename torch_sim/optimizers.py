@@ -479,7 +479,7 @@ class FireState(SimState):
     n_pos: torch.Tensor
 
 
-def fire(
+def fire(  # noqa: PLR0915
     model: torch.nn.Module,
     *,
     dt_max: float = 1.0,
@@ -489,6 +489,7 @@ def fire(
     f_dec: float = 0.5,
     alpha_start: float = 0.1,
     f_alpha: float = 0.99,
+    maxstep: float = 0.2,
 ) -> tuple[
     FireState,
     Callable[[FireState], FireState],
@@ -507,6 +508,7 @@ def fire(
         f_dec (float): Factor for timestep decrease when power is negative
         alpha_start (float): Initial velocity mixing parameter
         f_alpha (float): Factor for mixing parameter decrease
+        maxstep (float): Maximum distance an atom can move per step.
 
     Returns:
         tuple: A pair of functions:
@@ -524,8 +526,8 @@ def fire(
     eps = 1e-8 if dtype == torch.float32 else 1e-16
 
     # Setup parameters
-    params = [dt_max, dt_start, alpha_start, f_inc, f_dec, f_alpha, n_min]
-    dt_max, dt_start, alpha_start, f_inc, f_dec, f_alpha, n_min = [
+    params = [dt_max, dt_start, alpha_start, f_inc, f_dec, f_alpha, n_min, maxstep]
+    dt_max, dt_start, alpha_start, f_inc, f_dec, f_alpha, n_min, maxstep = [
         torch.as_tensor(p, device=device, dtype=dtype) for p in params
     ]
 
@@ -584,50 +586,32 @@ def fire(
     def fire_step(
         state: FireState,
         alpha_start: float = alpha_start,
-        dt_start: float = dt_start,
+        dt_start: float = dt_start,  # noqa: ARG001
+        maxstep: float = maxstep,
     ) -> FireState:
         """Perform one FIRE optimization step for batched atomic systems.
 
         Implements one step of the Fast Inertial Relaxation Engine (FIRE) algorithm for
-        optimizing atomic positions in a batched setting. Uses velocity Verlet
-        integration with adaptive velocity mixing.
+        optimizing atomic positions in a batched setting. Logic adapted to follow
+        ASE FIRE implementation more closely.
 
         Args:
             state: Current optimization state containing atomic parameters
-            alpha_start: Initial mixing parameter for velocity update
-            dt_start: Initial timestep for velocity Verlet integration
+            alpha_start: Initial mixing parameter for velocity update (used on reset)
+            dt_start: Initial timestep (unused in step function)
+            maxstep: Maximum allowed atom displacement per step.
 
         Returns:
             Updated state after performing one FIRE step
         """
         n_batches = state.n_batches
 
-        # Setup parameters
-        dt_start = torch.full((n_batches,), dt_start, device=device, dtype=dtype)
-        alpha_start = torch.full((n_batches,), alpha_start, device=device, dtype=dtype)
+        # Ensure parameters are tensors
+        alpha_start_t = torch.full((n_batches,), alpha_start, device=device, dtype=dtype)
+        maxstep_t = torch.as_tensor(maxstep, device=device, dtype=dtype)
 
-        # Velocity Verlet first half step (v += 0.5*a*dt)
-        atom_wise_dt = state.dt[state.batch].unsqueeze(-1)
-        state.velocities += 0.5 * atom_wise_dt * state.forces / state.masses.unsqueeze(-1)
-
-        # Split positions and forces into atomic and cell components
-        atomic_positions = state.positions  # shape: (n_atoms, 3)
-
-        # Update atomic positions
-        atomic_positions_new = atomic_positions + atom_wise_dt * state.velocities
-
-        # Update state with new positions and cell
-        state.positions = atomic_positions_new
-
-        # Get new forces, energy, and stress
-        results = model(state)
-        state.energy = results["energy"]
-        state.forces = results["forces"]
-
-        # Velocity Verlet first half step (v += 0.5*a*dt)
-        state.velocities += 0.5 * atom_wise_dt * state.forces / state.masses.unsqueeze(-1)
-
-        # Calculate power (F·V) for atoms
+        # 1. Calculate Power P = F · V (using current forces and velocities)
+        # Note: ASE calculates this *before* the VV step
         atomic_power = (state.forces * state.velocities).sum(dim=1)  # [n_atoms]
         atomic_power_per_batch = torch.zeros(
             n_batches, device=device, dtype=atomic_power.dtype
@@ -635,39 +619,91 @@ def fire(
         atomic_power_per_batch.scatter_add_(
             dim=0, index=state.batch, src=atomic_power
         )  # [n_batches]
-
-        # Calculate power for cell DOFs
         batch_power = atomic_power_per_batch
 
-        for batch_idx in range(n_batches):
-            # FIRE specific updates
-            if batch_power[batch_idx] > 0:  # Power is positive
-                state.n_pos[batch_idx] += 1
-                if state.n_pos[batch_idx] > n_min:
-                    state.dt[batch_idx] = min(state.dt[batch_idx] * f_inc, dt_max)
-                    state.alpha[batch_idx] = state.alpha[batch_idx] * f_alpha
-            else:  # Power is negative
-                state.n_pos[batch_idx] = 0
-                state.dt[batch_idx] = state.dt[batch_idx] * f_dec
-                state.alpha[batch_idx] = alpha_start[batch_idx]
-                # Reset velocities for both atoms and cell
-                state.velocities[state.batch == batch_idx] = 0
+        # 2. Determine which batches are moving downhill (P > 0)
+        # Create masks for convenience
+        downhill_mask_batch = batch_power > 0
+        uphill_mask_batch = ~downhill_mask_batch
 
-        # Mix velocity and force direction using FIRE for atoms
-        v_norm = torch.norm(state.velocities, dim=1, keepdim=True)
-        f_norm = torch.norm(state.forces, dim=1, keepdim=True)
-        # Avoid division by zero
-        # mask = f_norm > 1e-10
-        # state.velocity = torch.where(
-        #     mask,
-        #     (1.0 - state.alpha) * state.velocity
-        #     + state.alpha * state.forces * v_norm / f_norm,
-        #     state.velocity,
-        # )
+        # Get atom-wise masks
+        downhill_mask_atoms = downhill_mask_batch[state.batch]
+        _uphill_mask_atoms = uphill_mask_batch[state.batch]
+
+        # 3. Adapt dt and alpha based on Power (per batch)
+        # Increase dt/decrease alpha for downhill batches after Nmin steps
+        increase_dt_mask = downhill_mask_batch & (state.n_pos > n_min)
+        state.dt[increase_dt_mask] = torch.minimum(
+            state.dt[increase_dt_mask] * f_inc, dt_max
+        )
+        state.alpha[increase_dt_mask] *= f_alpha
+        state.n_pos[downhill_mask_batch] += 1  # Increment steps for all downhill batches
+
+        # Decrease dt and reset alpha/n_pos for uphill batches
+        state.dt[uphill_mask_batch] *= f_dec
+        state.alpha[uphill_mask_batch] = alpha_start_t[uphill_mask_batch]
+        state.n_pos[uphill_mask_batch] = 0
+
+        # 4. Update velocities step 1: Apply mixing only if P > 0, Reset if P <= 0
+        # Mix velocity and force direction using FIRE for downhill atoms
+        v_current = state.velocities
+        f_current = state.forces
+        v_norm = torch.norm(v_current, dim=1, keepdim=True)
+        f_norm = torch.norm(f_current, dim=1, keepdim=True)
         atom_wise_alpha = state.alpha[state.batch].unsqueeze(-1)
-        state.velocities = (
+
+        # Calculate mixed velocity component (only used if downhill)
+        v_mixed = (
             1.0 - atom_wise_alpha
-        ) * state.velocities + atom_wise_alpha * state.forces * v_norm / (f_norm + eps)
+        ) * v_current + atom_wise_alpha * f_current * v_norm / (f_norm + eps)
+
+        # Apply mixing only for downhill atoms, reset velocity for uphill atoms
+        state.velocities = torch.where(downhill_mask_atoms.unsqueeze(-1), v_mixed, 0.0)
+
+        # 5. Update velocities step 2: Add force contribution (like v += F*dt)
+        # This is slightly different from ASE's v += dt*f before mixing,
+        # but closer to the original FIRE paper's spirit within VV.
+        # Effectively v_new = v_mixed_or_zero + F*dt (where F is current force)
+        atom_wise_dt = state.dt[state.batch].unsqueeze(-1)
+        state.velocities += (
+            atom_wise_dt * f_current
+        )  # Using f_current consistent with P calc
+
+        # 6. Calculate displacement dr and apply maxstep constraint (per atom)
+        dr = atom_wise_dt * state.velocities  # Proposed displacement
+        # norm_dr = torch.norm(dr, dim=1) # Norm for each atom -- OLD per-atom
+
+        # Calculate global norm across all atoms
+        global_norm_dr = torch.norm(dr)
+
+        # Scale dr if norm > maxstep
+        # scale = torch.minimum(
+        #     maxstep_t / (norm_dr + eps),
+        #     torch.tensor(1.0, device=device, dtype=dtype)
+        # ) # OLD per-atom scale
+        # dr_scaled = dr * scale.unsqueeze(-1) # OLD per-atom scaling
+
+        # Calculate global scaling factor
+        global_scale = torch.minimum(
+            maxstep_t / (global_norm_dr + eps),
+            torch.tensor(1.0, device=device, dtype=dtype),
+        )
+
+        # Apply global scaling to all displacements
+        dr_scaled = dr * global_scale
+
+        # 7. Update positions
+        state.positions += dr_scaled
+
+        # 8. Get new forces and energy for the *next* step
+        # (This part remains the same - model uses the updated positions)
+        results = model(state)
+        state.energy = results["energy"]
+        state.forces = results["forces"]
+
+        # NOTE: We removed the Verlet half-step logic as ASE FIRE doesn't use it.
+        # The core is: Calculate P -> Adapt dt/alpha -> Mix/Reset v ->
+        # Update v+=f*dt -> Apply maxstep -> Update x
 
         return state
 
@@ -992,13 +1028,16 @@ def unit_cell_fire(  # noqa: C901, PLR0915
         # Get new forces, energy, and stress
         results = model(state)
         state.energy = results["energy"]
+
+        # Combine new atomic forces and cell forces
         forces = results["forces"]
         stress = results["stress"]
 
         state.forces = forces
         state.stress = stress
+
         # Calculate virial
-        volumes = torch.linalg.det(new_cell).view(-1, 1, 1)
+        volumes = torch.linalg.det(state.cell).view(-1, 1, 1)
         virial = -volumes * (stress + state.pressure)
         if state.hydrostatic_strain:
             diag_mean = torch.diagonal(virial, dim1=1, dim2=2).mean(dim=1, keepdim=True)
@@ -1011,9 +1050,38 @@ def unit_cell_fire(  # noqa: C901, PLR0915
                 3, device=device
             ).unsqueeze(0).expand(n_batches, -1, -1)
 
-        state.cell_forces = virial / state.cell_factor
+        # Perform batched matrix multiplication
+        ucf_cell_grad = torch.bmm(
+            virial, torch.linalg.inv(torch.transpose(cur_deform_grad, 1, 2))
+        )
 
-        # Velocity Verlet first half step (v += 0.5*a*dt)
+        # Pre-compute all 9 direction matrices
+        directions = torch.zeros((9, 3, 3), device=device, dtype=dtype)
+        for idx, (mu, nu) in enumerate([(i, j) for i in range(3) for j in range(3)]):
+            directions[idx, mu, nu] = 1.0
+
+        # Calculate cell forces batch by batch
+        cell_forces = torch.zeros_like(ucf_cell_grad)
+        for b in range(n_batches):
+            # Calculate all 9 Frechet derivatives at once
+            expm_derivs = torch.stack(
+                [
+                    tsm.expm_frechet(cur_deform_grad[b], direction, compute_expm=False)
+                    for direction in directions
+                ]
+            )
+
+            # Calculate all 9 cell forces components
+            forces_flat = torch.sum(
+                expm_derivs * ucf_cell_grad[b].unsqueeze(0), dim=(1, 2)
+            )
+            cell_forces[b] = forces_flat.reshape(3, 3)
+
+        # Scale by cell_factor
+        cell_forces = cell_forces / state.cell_factor
+        state.cell_forces = cell_forces
+
+        # Velocity Verlet second half step (v += 0.5*a*dt)
         state.velocities += 0.5 * atom_wise_dt * state.forces / state.masses.unsqueeze(-1)
         state.cell_velocities += (
             0.5 * cell_wise_dt * state.cell_forces / state.cell_masses.unsqueeze(-1)
@@ -1034,14 +1102,17 @@ def unit_cell_fire(  # noqa: C901, PLR0915
         )  # [n_batches]
         batch_power = atomic_power_per_batch + cell_power
 
+        # FIRE updates for each batch
         for batch_idx in range(n_batches):
             # FIRE specific updates
-            if batch_power[batch_idx] > 0:  # Power is positive
+            if batch_power[batch_idx] > 0:
+                # Power is positive
                 state.n_pos[batch_idx] += 1
                 if state.n_pos[batch_idx] > n_min:
                     state.dt[batch_idx] = min(state.dt[batch_idx] * f_inc, dt_max)
                     state.alpha[batch_idx] = state.alpha[batch_idx] * f_alpha
-            else:  # Power is negative
+            else:
+                # Power is negative
                 state.n_pos[batch_idx] = 0
                 state.dt[batch_idx] = state.dt[batch_idx] * f_dec
                 state.alpha[batch_idx] = alpha_start[batch_idx]
@@ -1052,14 +1123,6 @@ def unit_cell_fire(  # noqa: C901, PLR0915
         # Mix velocity and force direction using FIRE for atoms
         v_norm = torch.norm(state.velocities, dim=1, keepdim=True)
         f_norm = torch.norm(state.forces, dim=1, keepdim=True)
-        # Avoid division by zero
-        # mask = f_norm > 1e-10
-        # state.velocity = torch.where(
-        #     mask,
-        #     (1.0 - state.alpha) * state.velocity
-        #     + state.alpha * state.forces * v_norm / f_norm,
-        #     state.velocity,
-        # )
         batch_wise_alpha = state.alpha[state.batch].unsqueeze(-1)
         state.velocities = (
             1.0 - batch_wise_alpha
