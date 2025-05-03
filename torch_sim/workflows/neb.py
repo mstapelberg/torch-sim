@@ -107,7 +107,7 @@ class NEB:
         else:
             raise ValueError(f"Unsupported optimizer_type: {self.optimizer_type}")
 
-    def _interpolate_path(self, initial_state: SimState, final_state: SimState) -> GroupedSimState:
+    def _interpolate_path(self, initial_state: GroupedSimState, final_state: GroupedSimState) -> GroupedSimState:
         """Linearly interpolate the initial path between states using MIC.
 
         Generates `n_images` intermediate states between the initial and final states

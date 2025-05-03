@@ -39,7 +39,8 @@ logging.getLogger('torch_sim.workflows.neb').setLevel(logging.DEBUG)
 torch_sim_device = 'cuda' if torch.cuda.is_available() else 'cpu'
 torch_sim_dtype = torch.float64 # Use float64 for higher precision
 
-model_path = "/home/myless/Packages/forge/scratch/potentials/mace_gen_7_ensemble/job_gen_7-2025-04-14_model_0_pr_stagetwo.model"
+#model_path = "/home/myless/Packages/forge/scratch/potentials/mace_gen_7_ensemble/job_gen_7-2025-04-14_model_0_pr_stagetwo.model"
+model_path = "../../../../forge/scratch/potentials/mace_gen_7_ensemble/job_gen_7-2025-04-14_model_0_pr_stagetwo.model"
 # Load the actual MACE model
 mace_potential = torch.load(model_path, map_location=torch_sim_device)
 
@@ -166,6 +167,7 @@ def compare_initial_paths(ase_start_atoms, ase_end_atoms,
 
 
 def ase_neb(start_atoms, end_atoms, model_path, nimages=5):
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
     images = [start_atoms.copy() for _ in range(nimages + 1)]
     images.append(end_atoms.copy())
 
@@ -176,7 +178,7 @@ def ase_neb(start_atoms, end_atoms, model_path, nimages=5):
     ase_dtype_str = 'float64' if torch_sim_dtype == torch.float64 else 'float32'
     print(f"Attaching ASE calculator with dtype: {ase_dtype_str} to all images")
     for image in neb_calc.images:
-        image.calc = MACECalculator(model_paths=[model_path], device='cuda', dtype=ase_dtype_str, use_cueq=True)
+        image.calc = MACECalculator(model_paths=[model_path], device=device, dtype=ase_dtype_str, use_cueq=True)
 
     # Set up trajectory logging for the reference ASE run (Commented out as not used for plot)
     # ase_traj_filename = "ase_ref_neb.traj"
@@ -211,8 +213,10 @@ ts_mace_model = MaceModel(
 #initial_trajectory = read('/home/myless/Packages/forge/scratch/data/neb_workflow_data/Cr7Ti8V104W8Zr_Cr_to_V_site102_to_69_initial.xyz', index=':')
 #print(len(initial_trajectory))
 
-start_atoms = read('/home/myless/Packages/forge/scratch/data/vasp_jobs-neb-test/neb/Cr4Ti7V111W4Zr2_14_to_15/00/POSCAR')
-end_atoms = read('/home/myless/Packages/forge/scratch/data/vasp_jobs-neb-test/neb/Cr4Ti7V111W4Zr2_14_to_15/06/POSCAR')
+#start_atoms = read('/home/myless/Packages/forge/scratch/data/vasp_jobs-neb-test/neb/Cr4Ti7V111W4Zr2_14_to_15/00/POSCAR')
+#end_atoms = read('/home/myless/Packages/forge/scratch/data/vasp_jobs-neb-test/neb/Cr4Ti7V111W4Zr2_14_to_15/06/POSCAR')
+start_atoms = read('../../../../forge/scratch/data/vasp_jobs-neb-test/neb/Cr4Ti7V111W4Zr2_14_to_15/POSCAR_0.xyz')
+end_atoms = read('../../../../forge/scratch/data/vasp_jobs-neb-test/neb/Cr4Ti7V111W4Zr2_14_to_15/POSCAR_6.xyz')
 
 relaxed_start_atoms = relax_atoms(start_atoms, model_path)
 relaxed_end_atoms = relax_atoms(end_atoms, model_path)
@@ -233,12 +237,13 @@ ase_neb_compare = ASENEB(
 )
 ase_neb_compare.interpolate(mic=True) # Initial interpolation
 
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
 # Attach calculator to ALL ASE images
-ase_calculator = MACECalculator(model_paths=[model_path], device='cuda', dtype='float32', use_cueq=True)
+ase_calculator = MACECalculator(model_paths=[model_path], device=device, dtype='float32', use_cueq=True)
 # Ensure ASE calculator uses float64 if torch-sim does
 ase_dtype_str_compare = 'float64' if torch_sim_dtype == torch.float64 else 'float32'
 print(f"Using ASE comparison calculator dtype: {ase_dtype_str_compare}")
-ase_calculator = MACECalculator(model_paths=[model_path], device='cuda', dtype=ase_dtype_str_compare, use_cueq=True)
+ase_calculator = MACECalculator(model_paths=[model_path], device=device, dtype=ase_dtype_str_compare, use_cueq=True)
 for img in ase_neb_compare.images:
     img.calc = ase_calculator
 # ----------------------------------
