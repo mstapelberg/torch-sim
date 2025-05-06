@@ -539,7 +539,7 @@ def fire(
 
     eps = 1e-8 if dtype == torch.float32 else 1e-16
 
-    # Setup parameters, added maxstep for ASE style 
+    # Setup parameters, added maxstep for ASE style
     params = [dt_max, dt_start, alpha_start, f_inc, f_dec, f_alpha, n_min, maxstep]
     dt_max, dt_start, alpha_start, f_inc, f_dec, f_alpha, n_min, maxstep = [
         torch.as_tensor(p, device=device, dtype=dtype) for p in params
@@ -688,16 +688,17 @@ def fire(
         ) * state.velocities + atom_wise_alpha * state.forces * v_norm / (f_norm + eps)
 
         return state
-    
+
     def ase_fire_step(
             state: FireState,
             alpha_start: float = alpha_start,
     ) -> FireState:
         """Perform one ASE-like FIRE optimization step.
 
-        Implements one step of the Fast Inertial Relaxation Engine (FIRE) algorithm 
-        mimicking the ASE implementation. Uses adaptive velocity mixing but differs 
-        from the original paper (e.g. no explicit mass scaling in velocity update, maxstep).
+        Implements one step of the Fast Inertial Relaxation Engine (FIRE) algorithm
+        mimicking the ASE implementation. Uses adaptive velocity mixing but differs
+        from the original paper (e.g. no explicit mass scaling in velocity update).
+        Also, the maxstep constraint is applied per atom, not per batch.
 
         Args:
             state: Current optimization state containing atomic parameters
@@ -706,15 +707,14 @@ def fire(
         Returns:
             Updated state after performing one ASE-like FIRE step
         """
-        
-        n_batches = state.n_batches 
+        n_batches = state.n_batches
 
-        # setup batch-wise alpha_start for potential reset 
+        # setup batch-wise alpha_start for potential reset
         alpha_start_batch = torch.full(
             (n_batches,), alpha_start, device=state.device, dtype=state.dtype
         )
 
-        # calculate the power (F·V) for atoms and sum per batch 
+        # calculate the power (F·V) for atoms and sum per batch
         atomic_power = (state.forces * state.velocities).sum(dim=1) # [n_atoms]
         batch_power = torch.zeros(n_batches, device=state.device, dtype=atomic_power.dtype)
         batch_power.scatter_add_(dim=0, index=state.batch, src=atomic_power) # [n_batches]
@@ -723,16 +723,16 @@ def fire(
         positive_power_mask_batch = batch_power > 0
         negative_power_mask_batch = ~positive_power_mask_batch
 
-        # Update dt, alpha, n_pos based on the batch masks 
+        # Update dt, alpha, n_pos based on the batch masks
         # For positive power batches:
         state.n_pos[positive_power_mask_batch] += 1
         increase_dt_mask = (state.n_pos > n_min) & positive_power_mask_batch
         state.dt[increase_dt_mask] = torch.minimum(
-            state.dt[increase_dt_mask] * f_inc_tensor, dt_max_tensor
+            state.dt[increase_dt_mask] * f_inc, dt_max
         )
-        state.alpha[increase_dt_mask] *= f_alpha_tensor
+        state.alpha[increase_dt_mask] *= f_alpha
         # For negative power batches:
-        state.dt[negative_power_mask_batch] *= f_dec_tensor
+        state.dt[negative_power_mask_batch] *= f_dec
         state.alpha[negative_power_mask_batch] = alpha_start_batch[negative_power_mask_batch]
         state.n_pos[negative_power_mask_batch] = 0
 
@@ -741,38 +741,41 @@ def fire(
         f_norm = torch.norm(state.forces, dim=1, keepdim=True)
         f_unit = state.forces / (f_norm + eps)
 
-        # Get atom-wise alpha and masks 
+        # Get atom-wise alpha and masks
         alpha_atom = state.alpha[state.batch].unsqueeze(-1)
         positive_power_mask_atom = positive_power_mask_batch[state.batch].unsqueeze(-1)
 
         # calcualte updated velocity for positive power case
-        v_pos_updated = (1.0 - alpha_atom) * state.velocities + alpha_atom * f_unit * v_norm 
+        v_pos_updated = (1.0 - alpha_atom) * state.velocities + alpha_atom * f_unit * v_norm
 
-        # Set velocities to zero for negative power case, otherwise use updated positive velocity
+        # Set velocities to zero for negative power case
+        # otherwise use updated positive velocity
         state.velocities = torch.where(
-            positive_power_mask_atom, v_pos_updated, torch.zeros_like(state.velocities)
+            positive_power_mask_atom,
+            v_pos_updated,
+            torch.zeros_like(state.velocities)
         )
 
         # Acceleration step (ASE style: no mass: no problems)
         atom_wise_dt = state.dt[state.batch].unsqueeze(-1)
-        state.velocities += atom_wise_dt * state.forces 
+        state.velocities += atom_wise_dt * state.forces
 
         # Calculate position change (dr)
         dr = atom_wise_dt * state.velocities
 
-        # Apply maxstep constraint per atom 
+        # Apply maxstep constraint per atom
         dr_norm = torch.norm(dr, dim=1, keepdim=True)
-        limit_mask = dr_norm > maxstep 
+        limit_mask = dr_norm > maxstep
 
-        # Ensure dr_norm is not zero before division 
+        # Ensure dr_norm is not zero before division
         dr = torch.where(
             limit_mask, maxstep * dr / (dr_norm + eps), dr
         )
 
-        # Update positions 
-        state.positions += dr 
+        # Update positions
+        state.positions += dr
 
-        # Recalculate forces 
+        # Recalculate forces
         model_output = model(state)
         state.forces = model_output["forces"]
         state.energy = model_output["energy"]
