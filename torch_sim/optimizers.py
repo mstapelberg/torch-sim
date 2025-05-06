@@ -489,8 +489,10 @@ def fire(
     f_dec: float = 0.5,
     alpha_start: float = 0.1,
     f_alpha: float = 0.99,
+    maxstep: float = 0.2,
+    md_flavor: str = "vv_fire",
 ) -> tuple[
-    FireState,
+    Callable[[SimState | StateDict], FireState],
     Callable[[FireState], FireState],
 ]:
     """Initialize a batched FIRE optimization.
@@ -507,25 +509,39 @@ def fire(
         f_dec (float): Factor for timestep decrease when power is negative
         alpha_start (float): Initial velocity mixing parameter
         f_alpha (float): Factor for mixing parameter decrease
+        maxstep (float): Maximum distance an atom can move per iteration (default
+            value is 0.2). Only used when md_flavor='ase_fire'.
+        md_flavor ('vv_fire' | 'ase_fire'): The type of molecular dynamics flavor to run.
+            Options are 'vv_fire' (default, based on original paper and Velocity Verlet)
+            or 'ase_fire' (mimics ASE's FIRE implementation).
 
     Returns:
         tuple: A pair of functions:
             - Initialization function that creates a FireState
-            - Update function that performs one FIRE optimization step
+            - Update function (either vv_fire_step or ase_fire_step) that performs
+              one FIRE optimization step.
 
     Notes:
         - FIRE is generally more efficient than standard gradient descent for atomic
-          structure optimization
+          structure optimization.
+        - The 'vv_fire' flavor follows the original paper closely, including
+          integration with Velocity Verlet steps.
+        - The 'ase_fire' flavor mimics the implementation in ASE, which differs slightly
+          in the update steps and does not explicitly use atomic masses in the
+          velocity update step.
         - The algorithm adaptively adjusts step sizes and mixing parameters based
-          on the dot product of forces and velocities
+          on the dot product of forces and velocities (power).
     """
+    if md_flavor not in ["vv_fire", "ase_fire"]:
+        raise ValueError(f"Unknown md_flavor: {md_flavor}")
+
     device, dtype = model.device, model.dtype
 
     eps = 1e-8 if dtype == torch.float32 else 1e-16
 
-    # Setup parameters
-    params = [dt_max, dt_start, alpha_start, f_inc, f_dec, f_alpha, n_min]
-    dt_max, dt_start, alpha_start, f_inc, f_dec, f_alpha, n_min = [
+    # Setup parameters, added maxstep for ASE style 
+    params = [dt_max, dt_start, alpha_start, f_inc, f_dec, f_alpha, n_min, maxstep]
+    dt_max, dt_start, alpha_start, f_inc, f_dec, f_alpha, n_min, maxstep = [
         torch.as_tensor(p, device=device, dtype=dtype) for p in params
     ]
 
@@ -581,12 +597,12 @@ def fire(
             n_pos=n_pos,
         )
 
-    def fire_step(
+    def vv_fire_step(
         state: FireState,
         alpha_start: float = alpha_start,
         dt_start: float = dt_start,
     ) -> FireState:
-        """Perform one FIRE optimization step for batched atomic systems.
+        """Perform one Velocity-Verlet based FIRE optimization step.
 
         Implements one step of the Fast Inertial Relaxation Engine (FIRE) algorithm for
         optimizing atomic positions in a batched setting. Uses velocity Verlet
@@ -598,7 +614,7 @@ def fire(
             dt_start: Initial timestep for velocity Verlet integration
 
         Returns:
-            Updated state after performing one FIRE step
+            Updated state after performing one VV-FIRE step
         """
         n_batches = state.n_batches
 
@@ -608,6 +624,8 @@ def fire(
 
         # Velocity Verlet first half step (v += 0.5*a*dt)
         atom_wise_dt = state.dt[state.batch].unsqueeze(-1)
+
+        # Velocity Verlet first half step (v += 0.5*a*dt)
         state.velocities += 0.5 * atom_wise_dt * state.forces / state.masses.unsqueeze(-1)
 
         # Split positions and forces into atomic and cell components
@@ -624,7 +642,7 @@ def fire(
         state.energy = results["energy"]
         state.forces = results["forces"]
 
-        # Velocity Verlet first half step (v += 0.5*a*dt)
+        # Velocity Verlet second half step (v += 0.5*a*dt)
         state.velocities += 0.5 * atom_wise_dt * state.forces / state.masses.unsqueeze(-1)
 
         # Calculate power (F·V) for atoms
@@ -670,8 +688,107 @@ def fire(
         ) * state.velocities + atom_wise_alpha * state.forces * v_norm / (f_norm + eps)
 
         return state
+    
+    def ase_fire_step(
+            state: FireState,
+            alpha_start: float = alpha_start,
+    ) -> FireState:
+        """Perform one ASE-like FIRE optimization step.
 
-    return fire_init, fire_step
+        Implements one step of the Fast Inertial Relaxation Engine (FIRE) algorithm 
+        mimicking the ASE implementation. Uses adaptive velocity mixing but differs 
+        from the original paper (e.g. no explicit mass scaling in velocity update, maxstep).
+
+        Args:
+            state: Current optimization state containing atomic parameters
+            alpha_start: Initial mixing parameter for velocity update
+
+        Returns:
+            Updated state after performing one ASE-like FIRE step
+        """
+        
+        n_batches = state.n_batches 
+
+        # setup batch-wise alpha_start for potential reset 
+        alpha_start_batch = torch.full(
+            (n_batches,), alpha_start, device=state.device, dtype=state.dtype
+        )
+
+        # calculate the power (F·V) for atoms and sum per batch 
+        atomic_power = (state.forces * state.velocities).sum(dim=1) # [n_atoms]
+        batch_power = torch.zeros(n_batches, device=state.device, dtype=atomic_power.dtype)
+        batch_power.scatter_add_(dim=0, index=state.batch, src=atomic_power) # [n_batches]
+
+        # --- FIRE updates (ASE Style) ---
+        positive_power_mask_batch = batch_power > 0
+        negative_power_mask_batch = ~positive_power_mask_batch
+
+        # Update dt, alpha, n_pos based on the batch masks 
+        # For positive power batches:
+        state.n_pos[positive_power_mask_batch] += 1
+        increase_dt_mask = (state.n_pos > n_min) & positive_power_mask_batch
+        state.dt[increase_dt_mask] = torch.minimum(
+            state.dt[increase_dt_mask] * f_inc_tensor, dt_max_tensor
+        )
+        state.alpha[increase_dt_mask] *= f_alpha_tensor
+        # For negative power batches:
+        state.dt[negative_power_mask_batch] *= f_dec_tensor
+        state.alpha[negative_power_mask_batch] = alpha_start_batch[negative_power_mask_batch]
+        state.n_pos[negative_power_mask_batch] = 0
+
+        # Update velocities based on power (ASE style mixing)
+        v_norm = torch.norm(state.velocities, dim=1, keepdim=True)
+        f_norm = torch.norm(state.forces, dim=1, keepdim=True)
+        f_unit = state.forces / (f_norm + eps)
+
+        # Get atom-wise alpha and masks 
+        alpha_atom = state.alpha[state.batch].unsqueeze(-1)
+        positive_power_mask_atom = positive_power_mask_batch[state.batch].unsqueeze(-1)
+
+        # calcualte updated velocity for positive power case
+        v_pos_updated = (1.0 - alpha_atom) * state.velocities + alpha_atom * f_unit * v_norm 
+
+        # Set velocities to zero for negative power case, otherwise use updated positive velocity
+        state.velocities = torch.where(
+            positive_power_mask_atom, v_pos_updated, torch.zeros_like(state.velocities)
+        )
+
+        # Acceleration step (ASE style: no mass: no problems)
+        atom_wise_dt = state.dt[state.batch].unsqueeze(-1)
+        state.velocities += atom_wise_dt * state.forces 
+
+        # Calculate position change (dr)
+        dr = atom_wise_dt * state.velocities
+
+        # Apply maxstep constraint per atom 
+        dr_norm = torch.norm(dr, dim=1, keepdim=True)
+        limit_mask = dr_norm > maxstep 
+
+        # Ensure dr_norm is not zero before division 
+        dr = torch.where(
+            limit_mask, maxstep * dr / (dr_norm + eps), dr
+        )
+
+        # Update positions 
+        state.positions += dr 
+
+        # Recalculate forces 
+        model_output = model(state)
+        state.forces = model_output["forces"]
+        state.energy = model_output["energy"]
+
+        return state
+
+    # Return the init function and the selected step function
+    if md_flavor == "vv_fire":
+        step_func = vv_fire_step
+    elif md_flavor == "ase_fire":
+        step_func = ase_fire_step
+    else:
+        # This case is already checked above, but added for safety
+        raise ValueError(f"Internal error: Unknown md_flavor {md_flavor}")
+
+    return fire_init, step_func
 
 
 @dataclass
