@@ -636,10 +636,10 @@ def fire(  # noqa: PLR0915
         # Update state with new positions and cell
         state.positions = atomic_positions_new
 
-        # Get new forces, energy, and stress
+        # Get new forces, energy
         results = model(state)
-        state.energy = results["energy"]
-        state.forces = results["forces"]
+        for key in ("energy", "forces"):
+            setattr(state, key, results[key])
 
         # Velocity Verlet second half step (v += 0.5*a*dt)
         state.velocities += 0.5 * atom_wise_dt * state.forces / state.masses.unsqueeze(-1)
@@ -1112,13 +1112,11 @@ def unit_cell_fire(  # noqa: C901, PLR0915
 
         # Get new forces, energy, and stress
         results = model(state)
-        state.energy = results["energy"]
-        forces = results["forces"]
-        stress = results["stress"]
+        for key in ("energy", "forces", "stress"):
+            setattr(state, key, results[key])
 
-        state.forces = forces
-        state.stress = stress
         # Calculate virial
+        stress = results["stress"]
         volumes = torch.linalg.det(new_cell).view(-1, 1, 1)
         virial = -volumes * (stress + state.pressure)
         if state.hydrostatic_strain:
@@ -1353,9 +1351,8 @@ def unit_cell_fire(  # noqa: C901, PLR0915
         # ------------------------------------------------------------------
         # 7.  Force / stress refresh & new cell forces ----------------------
         results = model(state)
-        state.energy = results["energy"]
-        state.forces = results["forces"]
-        state.stress = results["stress"]
+        for key in ("energy", "forces", "stress"):
+            setattr(state, key, results[key])
 
         volumes = torch.linalg.det(new_cell).view(-1, 1, 1)
         if torch.any(volumes <= 0):
@@ -1745,16 +1742,11 @@ def frechet_cell_fire(  # noqa: C901, PLR0915
 
         # Get new forces and energy
         results = model(state)
-        state.energy = results["energy"]
-
-        # Combine new atomic forces and cell forces
-        forces = results["forces"]
-        stress = results["stress"]
-
-        state.forces = forces
-        state.stress = stress
+        for key in ("energy", "forces", "stress"):
+            setattr(state, key, results[key])
 
         # Calculate virial
+        stress = results["stress"]
         volumes = torch.linalg.det(state.cell).view(-1, 1, 1)
         virial = -volumes * (stress + state.pressure)  # P is P_ext * I
         if state.hydrostatic_strain:
@@ -1993,9 +1985,8 @@ def frechet_cell_fire(  # noqa: C901, PLR0915
 
         # 7. Force / stress refresh & new cell forces
         results = model(state)
-        state.energy = results["energy"]
-        state.forces = results["forces"]
-        state.stress = results["stress"]
+        for key in ("energy", "forces", "stress"):
+            setattr(state, key, results[key])
 
         # Recalculate cell_forces using Frechet derivative approach
         volumes = torch.linalg.det(state.cell).view(-1, 1, 1)  # Use updated state.cell
