@@ -889,11 +889,7 @@ def test_fire_fixed_cell_unit_cell_consistency(  # noqa: C901
         return not torch.allclose(current_energy, prev_energy, atol=1e-6)
 
     for state in [ar_supercell_sim_state_1, ar_supercell_sim_state_2]:
-        init_fn, update_fn = fire(
-            model=lj_model,
-            dt_max=0.3,
-            dt_start=0.1,
-        )
+        init_fn, update_fn = fire(model=lj_model, dt_max=0.3, dt_start=0.1)
 
         state_opt = init_fn(state)
 
@@ -908,7 +904,7 @@ def test_fire_fixed_cell_unit_cell_consistency(  # noqa: C901
             current_energy = state_opt.energy
             step += 1
             if step > 1000:
-                raise ValueError("Optimization did not converge")
+                raise ValueError(f"Optimization did not converge in {step=}")
 
         final_individual_states_fire.append(state_opt)
         total_steps_fire.append(step)
