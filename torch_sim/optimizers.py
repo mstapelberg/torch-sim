@@ -16,13 +16,17 @@ The module offers:
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal, get_args
 
 import torch
 
 import torch_sim.math as tsm
 from torch_sim.state import DeformGradMixin, SimState
 from torch_sim.typing import StateDict
+
+
+MdFlavor = Literal["vv_fire", "ase_fire"]
+vv_fire_key, ase_fire_key = get_args(MdFlavor)
 
 
 @dataclass
@@ -49,13 +53,8 @@ class GDState(SimState):
 
 
 def gradient_descent(
-    model: torch.nn.Module,
-    *,
-    lr: torch.Tensor | float = 0.01,
-) -> tuple[
-    Callable[[StateDict | SimState], GDState],
-    Callable[[GDState], GDState],
-]:
+    model: torch.nn.Module, *, lr: torch.Tensor | float = 0.01
+) -> tuple[Callable[[StateDict | SimState], GDState], Callable[[GDState], GDState]]:
     """Initialize a batched gradient descent optimization.
 
     Creates an optimizer that performs standard gradient descent on atomic positions
@@ -479,7 +478,7 @@ class FireState(SimState):
     n_pos: torch.Tensor
 
 
-def fire(  # noqa: C901, PLR0915
+def fire(  # noqa: PLR0915
     model: torch.nn.Module,
     *,
     dt_max: float = 1.0,
@@ -490,7 +489,7 @@ def fire(  # noqa: C901, PLR0915
     alpha_start: float = 0.1,
     f_alpha: float = 0.99,
     maxstep: float = 0.2,
-    md_flavor: str = "vv_fire",
+    md_flavor: MdFlavor = vv_fire_key,
 ) -> tuple[
     Callable[[SimState | StateDict], FireState],
     Callable[[FireState], FireState],
@@ -510,10 +509,10 @@ def fire(  # noqa: C901, PLR0915
         alpha_start (float): Initial velocity mixing parameter
         f_alpha (float): Factor for mixing parameter decrease
         maxstep (float): Maximum distance an atom can move per iteration (default
-            value is 0.2). Only used when md_flavor='ase_fire'.
-        md_flavor ('vv_fire' | 'ase_fire'): The type of molecular dynamics flavor to run.
-            Options are 'vv_fire' (default, based on original paper and Velocity Verlet)
-            or 'ase_fire' (mimics ASE's FIRE implementation).
+            value is 0.2). Only used when md_flavor="ase_fire".
+        md_flavor ("vv_fire" | "ase_fire"): The type of molecular dynamics flavor to run.
+            Options are "vv_fire" (default, based on original paper and Velocity Verlet)
+            or "ase_fire" (mimics ASE's FIRE implementation).
 
     Returns:
         tuple: A pair of functions:
@@ -524,16 +523,16 @@ def fire(  # noqa: C901, PLR0915
     Notes:
         - FIRE is generally more efficient than standard gradient descent for atomic
           structure optimization.
-        - The 'vv_fire' flavor follows the original paper closely, including
+        - The "vv_fire" flavor follows the original paper closely, including
           integration with Velocity Verlet steps.
-        - The 'ase_fire' flavor mimics the implementation in ASE, which differs slightly
+        - The "ase_fire" flavor mimics the implementation in ASE, which differs slightly
           in the update steps and does not explicitly use atomic masses in the
           velocity update step.
         - The algorithm adaptively adjusts step sizes and mixing parameters based
           on the dot product of forces and velocities (power).
     """
-    if md_flavor not in ["vv_fire", "ase_fire"]:
-        raise ValueError(f"Unknown {md_flavor=}")
+    if md_flavor not in get_args(MdFlavor):
+        raise ValueError(f"Unknown {md_flavor=}, must be one of {get_args(MdFlavor)}")
 
     device, dtype = model.device, model.dtype
 
@@ -787,15 +786,7 @@ def fire(  # noqa: C901, PLR0915
         return state
 
     # Return the init function and the selected step function
-    if md_flavor == "vv_fire":
-        step_func = vv_fire_step
-    elif md_flavor == "ase_fire":
-        step_func = ase_fire_step
-    else:
-        # This case is already checked above, but added for safety
-        raise ValueError(f"Internal error: Unknown {md_flavor=}")
-
-    return fire_init, step_func
+    return fire_init, {vv_fire_key: vv_fire_step, ase_fire_key: ase_fire_step}[md_flavor]
 
 
 @dataclass
@@ -888,7 +879,7 @@ def unit_cell_fire(  # noqa: C901, PLR0915
     constant_volume: bool = False,
     scalar_pressure: float = 0.0,
     maxstep: float = 0.2,
-    md_flavor: str = "vv_fire",
+    md_flavor: MdFlavor = vv_fire_key,
 ) -> tuple[
     UnitCellFireState,
     Callable[[UnitCellFireState], UnitCellFireState],
@@ -916,7 +907,7 @@ def unit_cell_fire(  # noqa: C901, PLR0915
         constant_volume (bool): Whether to maintain constant volume during optimization
         scalar_pressure (float): Applied external pressure in GPa
         maxstep (float): Maximum allowed step size for ase_fire
-        md_flavor (Literal["vv_fire", "ase_fire"]): Optimization flavor
+        md_flavor ("vv_fire" | "ase_fire"): Optimization flavor
 
     Returns:
         tuple: A pair of functions:
@@ -933,8 +924,8 @@ def unit_cell_fire(  # noqa: C901, PLR0915
         - The cell_factor parameter controls the relative scale of atomic vs cell
           optimization
     """
-    if md_flavor not in ["vv_fire", "ase_fire"]:
-        raise ValueError(f"Unknown {md_flavor=}")
+    if md_flavor not in get_args(MdFlavor):
+        raise ValueError(f"Unknown {md_flavor=}, must be one of {get_args(MdFlavor)}")
     device, dtype = model.device, model.dtype
 
     eps = 1e-8 if dtype == torch.float32 else 1e-16
@@ -1402,15 +1393,7 @@ def unit_cell_fire(  # noqa: C901, PLR0915
         return state
 
     # Return the init function and the selected step function
-    if md_flavor == "vv_fire":
-        step_func = vv_fire_step
-    elif md_flavor == "ase_fire":
-        step_func = ase_fire_step
-    else:
-        # This case is already checked above, but added for safety
-        raise ValueError(f"Internal error: Unknown {md_flavor=}")
-
-    return fire_init, step_func
+    return fire_init, {vv_fire_key: vv_fire_step, ase_fire_key: ase_fire_step}[md_flavor]
 
 
 @dataclass
@@ -1503,7 +1486,7 @@ def frechet_cell_fire(  # noqa: C901, PLR0915
     constant_volume: bool = False,
     scalar_pressure: float = 0.0,
     maxstep: float = 0.2,
-    md_flavor: str = "vv_fire",
+    md_flavor: MdFlavor = vv_fire_key,
 ) -> tuple[
     FrechetCellFIREState,
     Callable[[FrechetCellFIREState], FrechetCellFIREState],
@@ -1532,7 +1515,7 @@ def frechet_cell_fire(  # noqa: C901, PLR0915
         constant_volume (bool): Whether to maintain constant volume during optimization
         scalar_pressure (float): Applied external pressure in GPa
         maxstep (float): Maximum allowed step size for ase_fire
-        md_flavor (str): Optimization flavor, either "vv_fire" or "ase_fire"
+        md_flavor ("vv_fire" | "ase_fire"): Optimization flavor
 
     Returns:
         tuple: A pair of functions:
@@ -1548,8 +1531,8 @@ def frechet_cell_fire(  # noqa: C901, PLR0915
         - To fix the cell and only optimize atomic positions, set both
           constant_volume=True and hydrostatic_strain=True
     """
-    if md_flavor not in ["vv_fire", "ase_fire"]:
-        raise ValueError(f"Unknown {md_flavor=}")
+    if md_flavor not in get_args(MdFlavor):
+        raise ValueError(f"Unknown {md_flavor=}, must be one of {get_args(MdFlavor)}")
     device, dtype = model.device, model.dtype
 
     eps = 1e-8 if dtype == torch.float32 else 1e-16
@@ -2065,11 +2048,4 @@ def frechet_cell_fire(  # noqa: C901, PLR0915
         return state
 
     # Return the init function and the selected step function
-    if md_flavor == "vv_fire":
-        step_func = vv_fire_step
-    elif md_flavor == "ase_fire":
-        step_func = ase_fire_step
-    else:
-        raise ValueError(f"Internal error: Unknown {md_flavor=}")
-
-    return fire_init, step_func
+    return fire_init, {vv_fire_key: vv_fire_step, ase_fire_key: ase_fire_step}[md_flavor]

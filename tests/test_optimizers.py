@@ -1,9 +1,11 @@
 import copy
+from typing import get_args
 
 import pytest
 import torch
 
 from torch_sim.optimizers import (
+    MdFlavor,
     fire,
     frechet_cell_fire,
     gradient_descent,
@@ -103,9 +105,9 @@ def test_unit_cell_gradient_descent_optimization(
     assert not torch.allclose(state.cell, initial_state.cell)
 
 
-@pytest.mark.parametrize("md_flavor", ["vv_fire", "ase_fire"])
+@pytest.mark.parametrize("md_flavor", get_args(MdFlavor))
 def test_fire_optimization(
-    ar_supercell_sim_state: SimState, lj_model: torch.nn.Module, md_flavor: str
+    ar_supercell_sim_state: SimState, lj_model: torch.nn.Module, md_flavor: MdFlavor
 ) -> None:
     """Test that the FIRE optimizer actually minimizes energy."""
     # Add some random displacement to positions
@@ -170,9 +172,9 @@ def test_fire_optimization(
     )
 
 
-@pytest.mark.parametrize("md_flavor", ["vv_fire", "ase_fire"])
+@pytest.mark.parametrize("md_flavor", get_args(MdFlavor))
 def test_unit_cell_fire_optimization(
-    ar_supercell_sim_state: SimState, lj_model: torch.nn.Module, md_flavor: str
+    ar_supercell_sim_state: SimState, lj_model: torch.nn.Module, md_flavor: MdFlavor
 ) -> None:
     """Test that the FIRE optimizer actually minimizes energy."""
     print(f"\n--- Starting test_unit_cell_fire_optimization for {md_flavor=} ---")
@@ -269,9 +271,9 @@ def test_unit_cell_fire_optimization(
     )
 
 
-@pytest.mark.parametrize("md_flavor", ["vv_fire", "ase_fire"])
+@pytest.mark.parametrize("md_flavor", get_args(MdFlavor))
 def test_frechet_cell_fire_optimization(
-    ar_supercell_sim_state: SimState, lj_model: torch.nn.Module, md_flavor: str
+    ar_supercell_sim_state: SimState, lj_model: torch.nn.Module, md_flavor: MdFlavor
 ) -> None:
     """Test that the Frechet Cell FIRE optimizer actually minimizes energy for different
     md_flavors."""
