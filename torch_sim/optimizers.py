@@ -12,7 +12,7 @@ The module offers:
 * FIRE (Fast Inertial Relaxation Engine) optimization with unit cell parameters
 * FIRE optimization with Frechet cell parameterization for improved cell relaxation
 
-ASE-style FIRE: https://gitlab.com/ase/ase/-/blob/master/ase/optimize/fire.py?ref_type=heads 
+ASE-style FIRE: https://gitlab.com/ase/ase/-/blob/master/ase/optimize/fire.py?ref_type=heads
 Velocity Verlet-style FIRE: https://doi.org/10.1103/PhysRevLett.97.170201
 
 """
@@ -514,7 +514,8 @@ def fire(
         f_alpha (float): Factor for mixing parameter decrease
         maxstep (float): Maximum distance an atom can move per iteration (default
             value is 0.2). Only used when md_flavor='ase_fire'.
-        md_flavor (MdFlavor): Optimization flavor, either "vv_fire" or "ase_fire" (default)
+        md_flavor (MdFlavor): Optimization flavor, either "vv_fire" or "ase_fire".
+            Default is "ase_fire".
 
     Returns:
         tuple: A pair of functions:
@@ -750,7 +751,8 @@ def unit_cell_fire(
         constant_volume (bool): Whether to maintain constant volume during optimization
         scalar_pressure (float): Applied external pressure in GPa
         maxstep (float): Maximum allowed step size for ase_fire
-        md_flavor (MdFlavor): Optimization flavor, either "vv_fire" or "ase_fire" (default)
+        md_flavor (MdFlavor): Optimization flavor, either "vv_fire" or "ase_fire".
+            Default is "ase_fire".
 
     Returns:
         tuple: A pair of functions:
@@ -1046,7 +1048,8 @@ def frechet_cell_fire(
         constant_volume (bool): Whether to maintain constant volume during optimization
         scalar_pressure (float): Applied external pressure in GPa
         maxstep (float): Maximum allowed step size for ase_fire
-        md_flavor (MdFlavor): Optimization flavor, either "vv_fire" or "ase_fire" (default)
+        md_flavor (MdFlavor): Optimization flavor, either "vv_fire" or "ase_fire".
+            Default is "ase_fire".
 
     Returns:
         tuple: A pair of functions:
@@ -1276,6 +1279,7 @@ def _vv_fire_step(  # noqa: C901, PLR0915
     n_batches = state.n_batches
     device = state.positions.device
     dtype = state.positions.dtype
+    deform_grad_new: torch.Tensor | None = None
 
     alpha_start_batch = torch.full(
         (n_batches,), alpha_start_val.item(), device=device, dtype=dtype
@@ -1317,9 +1321,8 @@ def _vv_fire_step(  # noqa: C901, PLR0915
         else:
             assert isinstance(state, UnitCellFireState)
             cur_deform_grad = state.deform_grad()
-            cell_factor_expanded = state.cell_factor.expand(
-                n_batches, 3, 1
-            )  # cell_factor is (N,1,1) or (N,)
+            # cell_factor is (N,1,1)
+            cell_factor_expanded = state.cell_factor.expand(n_batches, 3, 1)
             current_cell_positions_scaled = (
                 cur_deform_grad.view(n_batches, 3, 3) * cell_factor_expanded
             )
@@ -1555,7 +1558,7 @@ def _ase_fire_step(  # noqa: C901, PLR0915
     dr_atom = atom_dt * state.velocities
     if is_cell_optimization:
         assert isinstance(state, (UnitCellFireState, FrechetCellFIREState))
-        dr_cell = cell_dt * state.cell_velocities  # Define dr_cell here
+        dr_cell = cell_dt * state.cell_velocities
 
     # 6. Clamp to maxstep
     # Atoms
@@ -1579,12 +1582,10 @@ def _ase_fire_step(  # noqa: C901, PLR0915
     # 7. Position / cell update
     state.positions += dr_atom
 
-    F_new: torch.Tensor | None = (
-        None  # To store F_new for Frechet's ucf_cell_grad if needed
-    )
-    logm_F_new: torch.Tensor | None = (
-        None  # To store logm_F_new for Frechet's cell_forces recalc if needed
-    )
+    # F_new stores F_new for Frechet's ucf_cell_grad if needed
+    F_new: torch.Tensor | None = None
+    # logm_F_new stores logm_F_new for Frechet's cell_forces recalc if needed
+    logm_F_new: torch.Tensor | None = None
 
     if is_cell_optimization:
         assert isinstance(state, (UnitCellFireState, FrechetCellFIREState))
@@ -1593,9 +1594,8 @@ def _ase_fire_step(  # noqa: C901, PLR0915
             # Frechet cell update logic
             new_logm_F_scaled = state.cell_positions + dr_cell
             state.cell_positions = new_logm_F_scaled
-            logm_F_new = new_logm_F_scaled / (
-                state.cell_factor + eps
-            )  # cell_factor is (N,1,1)
+            # cell_factor is (N,1,1)
+            logm_F_new = new_logm_F_scaled / (state.cell_factor + eps)
             F_new = torch.matrix_exp(logm_F_new)
             new_row_vector_cell = torch.bmm(
                 state.reference_row_vector_cell, F_new.transpose(-2, -1)
@@ -1608,14 +1608,11 @@ def _ase_fire_step(  # noqa: C901, PLR0915
             # state.cell_factor is (N,1,1), F_current is (N,3,3)
             # cell_factor_exp for element-wise F_current * cell_factor_exp should be
             # (N,3,3) or broadcast from (N,1,1) or (N,3,1)
-            # Original unit_cell_fire.ase_fire_step used .expand(n_batches, 3, 1)
             cell_factor_exp_mult = state.cell_factor.expand(n_batches, 3, 1)
             current_F_scaled = F_current * cell_factor_exp_mult
 
             F_new_scaled = current_F_scaled + dr_cell
-            state.cell_positions = (
-                F_new_scaled  # This tracks the scaled deformation gradient
-            )
+            state.cell_positions = F_new_scaled  # track the scaled deformation gradient
             F_new = F_new_scaled / (cell_factor_exp_mult + eps)  # Division by (N,3,1)
             new_cell = torch.bmm(state.reference_cell, F_new.transpose(-2, -1))
             state.cell = new_cell
