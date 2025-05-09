@@ -1,7 +1,6 @@
 import copy
 
 import pytest
-
 import torch
 
 from torch_sim.optimizers import (
@@ -51,7 +50,7 @@ def test_gradient_descent_optimization(
 
     # Check force convergence
     max_force = torch.max(torch.norm(state.forces, dim=1))
-    assert max_force < 0.2, f"Forces should be small after optimization (got {max_force})"
+    assert max_force < 0.2, f"Forces should be small after optimization, got {max_force=}"
 
     assert not torch.allclose(state.positions, initial_state.positions)
 
@@ -96,9 +95,9 @@ def test_unit_cell_gradient_descent_optimization(
     max_force = torch.max(torch.norm(state.forces, dim=1))
     pressure = torch.trace(state.stress.squeeze(0)) / 3.0
     assert pressure < 0.01, (
-        f"Pressure should be small after optimization (got {pressure})"
+        f"Pressure should be small after optimization, got {pressure=}"
     )
-    assert max_force < 0.2, f"Forces should be small after optimization (got {max_force})"
+    assert max_force < 0.2, f"Forces should be small after optimization, got {max_force=}"
 
     assert not torch.allclose(state.positions, initial_state.positions)
     assert not torch.allclose(state.cell, initial_state.cell)
@@ -112,7 +111,10 @@ def test_fire_optimization(
     # Add some random displacement to positions
     # Create a fresh copy for each test run to avoid interference
 
-    current_positions = ar_supercell_sim_state.positions.clone() + torch.randn_like(ar_supercell_sim_state.positions) * 0.1
+    current_positions = (
+        ar_supercell_sim_state.positions.clone()
+        + torch.randn_like(ar_supercell_sim_state.positions) * 0.1
+    )
 
     current_sim_state = SimState(
         positions=current_positions,
@@ -137,13 +139,13 @@ def test_fire_optimization(
 
     # Run optimization for a few steps
     energies = [1000, state.energy.item()]
-    max_steps = 1000 # Add max step to prevent infinite loop
+    max_steps = 1000  # Add max step to prevent infinite loop
     steps_taken = 0
     while abs(energies[-2] - energies[-1]) > 1e-6 and steps_taken < max_steps:
         state = update_fn(state)
         energies.append(state.energy.item())
         steps_taken += 1
-    
+
     if steps_taken == max_steps:
         print(f"FIRE optimization for {md_flavor=} did not converge in {max_steps} steps")
 
@@ -157,22 +159,33 @@ def test_fire_optimization(
 
     # Check force convergence
     max_force = torch.max(torch.norm(state.forces, dim=1))
-    # bumped up the tolerance to 0.3 to account for the fact that ase_fire is more lenient in beginning steps
-    assert max_force < 0.3, f"Forces ({md_flavor=}) should be small after optimization (got {max_force})"
+    # bumped up the tolerance to 0.3 to account for the fact that ase_fire is more lenient
+    # in beginning steps
+    assert max_force < 0.3, (
+        f"{md_flavor=} forces should be small after optimization, got {max_force=}"
+    )
 
-    assert not torch.allclose(state.positions, initial_state_positions), \
-        f"Positions ({md_flavor=}) should have changed after optimization."
+    assert not torch.allclose(state.positions, initial_state_positions), (
+        f"{md_flavor=} positions should have changed after optimization."
+    )
+
 
 @pytest.mark.parametrize("md_flavor", ["vv_fire", "ase_fire"])
 def test_unit_cell_fire_optimization(
     ar_supercell_sim_state: SimState, lj_model: torch.nn.Module, md_flavor: str
 ) -> None:
     """Test that the FIRE optimizer actually minimizes energy."""
-    print(f"\n--- Starting test_unit_cell_fire_optimization for md_flavor: {md_flavor} ---")
+    print(f"\n--- Starting test_unit_cell_fire_optimization for {md_flavor=} ---")
 
     # Add random displacement to positions and cell
-    current_positions = ar_supercell_sim_state.positions.clone() + torch.randn_like(ar_supercell_sim_state.positions) * 0.1
-    current_cell = ar_supercell_sim_state.cell.clone() + torch.randn_like(ar_supercell_sim_state.cell) * 0.01 # Reduced cell perturbation slightly
+    current_positions = (
+        ar_supercell_sim_state.positions.clone()
+        + torch.randn_like(ar_supercell_sim_state.positions) * 0.1
+    )
+    current_cell = (
+        ar_supercell_sim_state.cell.clone()
+        + torch.randn_like(ar_supercell_sim_state.cell) * 0.01
+    )  # Reduced cell perturbation slightly
 
     current_sim_state = SimState(
         positions=current_positions,
@@ -200,25 +213,35 @@ def test_unit_cell_fire_optimization(
     print(f"[{md_flavor}] Optimizer functions obtained.")
 
     state = init_fn(current_sim_state)
-    print(f"[{md_flavor}] Initial state created by init_fn. Energy: {state.energy.item() if hasattr(state, 'energy') else 'N/A'}")
+    energy = float(getattr(state, "energy", "nan"))
+    print(f"[{md_flavor}] Initial state created by init_fn. {energy=:.4f}")
 
     # Run optimization for a few steps
-    energies = [1000.0, state.energy.item()] # Ensure float for comparison
-    max_steps = 1000 # MODIFIED: Drastically reduced for initial debugging of ase_fire hanging
+    energies = [1000.0, state.energy.item()]  # Ensure float for comparison
+    max_steps = (
+        1000  # MODIFIED: Drastically reduced for initial debugging of ase_fire hanging
+    )
     steps_taken = 0
 
     while abs(energies[-2] - energies[-1]) > 1e-6 and steps_taken < max_steps:
-        state = update_fn(state) 
+        state = update_fn(state)
         energies.append(state.energy.item())
         steps_taken += 1
 
     print(f"[{md_flavor}] Loop finished after {steps_taken} steps.")
 
-    if steps_taken == max_steps and abs(energies[-2] - energies[-1]) > 1e-6 : # MODIFIED: Check if max_steps was hit AND not converged
-        print(f"WARNING: Unit Cell FIRE optimization ({md_flavor=}) did not converge in {max_steps} steps. Final energy: {energies[-1]}")
+    if (
+        steps_taken == max_steps and abs(energies[-2] - energies[-1]) > 1e-6
+    ):  # MODIFIED: Check if max_steps was hit AND not converged
+        print(
+            f"WARNING: Unit Cell FIRE {md_flavor=} optimization did not converge "
+            f"in {max_steps} steps. Final energy: {energies[-1]:.4f}"
+        )
     else:
-        print(f"Unit Cell FIRE optimization ({md_flavor=}) converged in {steps_taken} steps. Final energy: {energies[-1]}")
-
+        print(
+            f"Unit Cell FIRE {md_flavor=} optimization converged in {steps_taken} "
+            f"steps. Final energy: {energies[-1]:.4f}"
+        )
 
     energies = energies[1:]
 
@@ -232,27 +255,38 @@ def test_unit_cell_fire_optimization(
     max_force = torch.max(torch.norm(state.forces, dim=1))
     pressure = torch.trace(state.stress.squeeze(0)) / 3.0
     assert pressure < 0.01, (
-        f"Pressure should be small after optimization (got {pressure})"
+        f"Pressure should be small after optimization, got {pressure=}"
     )
-    assert max_force < 0.3, f"Forces ({md_flavor=}) should be small after optimization (got {max_force})"
+    assert max_force < 0.3, (
+        f"{md_flavor=} forces should be small after optimization, got {max_force=}"
+    )
 
-    assert not torch.allclose(state.positions, initial_state_positions), \
-        f"Positions ({md_flavor=}) should have changed after optimization."
-    assert not torch.allclose(state.cell, initial_state_cell), \
-        f"Cell ({md_flavor=}) should have changed after optimization."
+    assert not torch.allclose(state.positions, initial_state_positions), (
+        f"{md_flavor=} positions should have changed after optimization."
+    )
+    assert not torch.allclose(state.cell, initial_state_cell), (
+        f"{md_flavor=} cell should have changed after optimization."
+    )
 
 
 @pytest.mark.parametrize("md_flavor", ["vv_fire", "ase_fire"])
 def test_frechet_cell_fire_optimization(
     ar_supercell_sim_state: SimState, lj_model: torch.nn.Module, md_flavor: str
 ) -> None:
-    """Test that the Frechet Cell FIRE optimizer actually minimizes energy for different md_flavors."""
-    print(f"\n--- Starting test_frechet_cell_fire_optimization for md_flavor: {md_flavor} ---")
+    """Test that the Frechet Cell FIRE optimizer actually minimizes energy for different
+    md_flavors."""
+    print(f"\n--- Starting test_frechet_cell_fire_optimization for {md_flavor=} ---")
 
     # Add random displacement to positions and cell
     # Create a fresh copy for each test run to avoid interference
-    current_positions = ar_supercell_sim_state.positions.clone() + torch.randn_like(ar_supercell_sim_state.positions) * 0.1
-    current_cell = ar_supercell_sim_state.cell.clone() + torch.randn_like(ar_supercell_sim_state.cell) * 0.01
+    current_positions = (
+        ar_supercell_sim_state.positions.clone()
+        + torch.randn_like(ar_supercell_sim_state.positions) * 0.1
+    )
+    current_cell = (
+        ar_supercell_sim_state.cell.clone()
+        + torch.randn_like(ar_supercell_sim_state.cell) * 0.01
+    )
 
     current_sim_state = SimState(
         positions=current_positions,
@@ -278,55 +312,65 @@ def test_frechet_cell_fire_optimization(
     print(f"[{md_flavor}] Frechet optimizer functions obtained.")
 
     state = init_fn(current_sim_state)
-    print(f"[{md_flavor}] Initial state created by Frechet init_fn. Energy: {state.energy.item() if hasattr(state, 'energy') else 'N/A'}")
+    energy = float(getattr(state, "energy", "nan"))
+    print(f"[{md_flavor}] Initial state created by Frechet init_fn. {energy=:.4f}")
 
     # Run optimization for a few steps
-    energies = [1000.0, state.energy.item()] # Ensure float for comparison
-    max_steps = 1000 
+    energies = [1000.0, state.energy.item()]  # Ensure float for comparison
+    max_steps = 1000
     steps_taken = 0
     print(f"[{md_flavor}] Entering Frechet optimization loop (max_steps: {max_steps})...")
-
 
     while abs(energies[-2] - energies[-1]) > 1e-6 and steps_taken < max_steps:
         state = update_fn(state)
         energies.append(state.energy.item())
         steps_taken += 1
-    
+
     print(f"[{md_flavor}] Frechet loop finished after {steps_taken} steps.")
 
-    if steps_taken == max_steps and abs(energies[-2] - energies[-1]) > 1e-6 :
-        print(f"WARNING: Frechet Cell FIRE optimization ({md_flavor=}) did not converge in {max_steps} steps. Final energy: {energies[-1]}")
+    if steps_taken == max_steps and abs(energies[-2] - energies[-1]) > 1e-6:
+        print(
+            f"WARNING: Frechet Cell FIRE {md_flavor=} optimization did not converge "
+            f"in {max_steps} steps. Final energy: {energies[-1]:.4f}"
+        )
     else:
-        print(f"Frechet Cell FIRE optimization ({md_flavor=}) converged in {steps_taken} steps. Final energy: {energies[-1]}")
-
+        print(
+            f"Frechet Cell FIRE {md_flavor=} optimization converged in {steps_taken} "
+            f"steps. Final energy: {energies[-1]:.4f}"
+        )
 
     energies = energies[1:]
 
     # Check that energy decreased
     assert energies[-1] < energies[0], (
-        f"Frechet FIRE optimization ({md_flavor=}) should reduce energy "
+        f"Frechet FIRE {md_flavor=} optimization should reduce energy "
         f"(initial: {energies[0]}, final: {energies[-1]})"
     )
 
     # Check force convergence
     max_force = torch.max(torch.norm(state.forces, dim=1))
-    pressure = torch.trace(state.stress.squeeze(0)) / 3.0 # Assumes single batch for this state stress access
-    
+    pressure = (
+        torch.trace(state.stress.squeeze(0)) / 3.0
+    )  # Assumes single batch for this state stress access
+
     # Adjust tolerances if needed, Frechet might behave slightly differently
-    pressure_tolerance = 0.01 
-    force_tolerance = 0.2  
+    pressure_tolerance = 0.01
+    force_tolerance = 0.2
 
     assert torch.abs(pressure) < pressure_tolerance, (
-        f"Pressure ({md_flavor=}) should be small after Frechet optimization (got {pressure.item()})"
+        f"{md_flavor=} pressure should be small after Frechet optimization, "
+        f"got {pressure.item()}"
     )
     assert max_force < force_tolerance, (
-        f"Forces ({md_flavor=}) should be small after Frechet optimization (got {max_force})"
+        f"{md_flavor=} forces should be small after Frechet optimization, got {max_force}"
     )
 
-    assert not torch.allclose(state.positions, initial_state_positions, atol=1e-5), \
-        f"Positions ({md_flavor=}) should have changed after Frechet optimization."
-    assert not torch.allclose(state.cell, initial_state_cell, atol=1e-5), \
-        f"Cell ({md_flavor=}) should have changed after Frechet optimization."
+    assert not torch.allclose(state.positions, initial_state_positions, atol=1e-5), (
+        f"{md_flavor=} positions should have changed after Frechet optimization."
+    )
+    assert not torch.allclose(state.cell, initial_state_cell, atol=1e-5), (
+        f"{md_flavor=} cell should have changed after Frechet optimization."
+    )
 
 
 def test_fire_multi_batch(
@@ -390,7 +434,7 @@ def test_fire_multi_batch(
     # transfer the energy and force checks to the batched optimizer
     max_force = torch.max(torch.norm(state.forces, dim=1))
     assert torch.all(max_force < 0.1), (
-        f"Forces should be small after optimization (got {max_force})"
+        f"Forces should be small after optimization, got {max_force=}"
     )
 
     n_ar_atoms = ar_supercell_sim_state.n_atoms
@@ -561,19 +605,19 @@ def test_unit_cell_fire_multi_batch(
     # transfer the energy and force checks to the batched optimizer
     max_force = torch.max(torch.norm(state.forces, dim=1))
     assert torch.all(max_force < 0.1), (
-        f"Forces should be small after optimization (got {max_force})"
+        f"Forces should be small after optimization, got {max_force=}"
     )
 
     pressure_0 = torch.trace(state.stress[0]) / 3.0
     pressure_1 = torch.trace(state.stress[1]) / 3.0
     assert torch.allclose(pressure_0, pressure_1), (
-        f"Pressure should be the same for all batches (got {pressure_0} and {pressure_1})"
+        f"Pressure should be the same for all batches, got {pressure_0=}, {pressure_1=}"
     )
     assert pressure_0 < 0.01, (
-        f"Pressure should be small after optimization (got {pressure_0})"
+        f"Pressure should be small after optimization, got {pressure_0=}"
     )
     assert pressure_1 < 0.01, (
-        f"Pressure should be small after optimization (got {pressure_1})"
+        f"Pressure should be small after optimization, got {pressure_1=}"
     )
 
     n_ar_atoms = ar_supercell_sim_state.n_atoms
@@ -745,19 +789,19 @@ def test_unit_cell_frechet_fire_multi_batch(
     # transfer the energy and force checks to the batched optimizer
     max_force = torch.max(torch.norm(state.forces, dim=1))
     assert torch.all(max_force < 0.1), (
-        f"Forces should be small after optimization (got {max_force})"
+        f"Forces should be small after optimization, got {max_force=}"
     )
 
     pressure_0 = torch.trace(state.stress[0]) / 3.0
     pressure_1 = torch.trace(state.stress[1]) / 3.0
     assert torch.allclose(pressure_0, pressure_1), (
-        f"Pressure should be the same for all batches (got {pressure_0} and {pressure_1})"
+        f"Pressure should be the same for all batches, got {pressure_0=}, {pressure_1=}"
     )
     assert pressure_0 < 0.01, (
-        f"Pressure should be small after optimization (got {pressure_0})"
+        f"Pressure should be small after optimization, got {pressure_0=}"
     )
     assert pressure_1 < 0.01, (
-        f"Pressure should be small after optimization (got {pressure_1})"
+        f"Pressure should be small after optimization, got {pressure_1=}"
     )
 
     n_ar_atoms = ar_supercell_sim_state.n_atoms
