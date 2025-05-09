@@ -493,7 +493,7 @@ def fire(
     alpha_start: float = 0.1,
     f_alpha: float = 0.99,
     maxstep: float = 0.2,
-    md_flavor: str = "ase_fire",
+    md_flavor: MdFlavor = ase_fire_key,
 ) -> tuple[
     Callable[[SimState | StateDict], FireState],
     Callable[[FireState], FireState],
@@ -514,7 +514,7 @@ def fire(
         f_alpha (float): Factor for mixing parameter decrease
         maxstep (float): Maximum distance an atom can move per iteration (default
             value is 0.2). Only used when md_flavor='ase_fire'.
-        md_flavor (str): Optimization flavor, either "vv_fire" or "ase_fire" (default)
+        md_flavor (MdFlavor): Optimization flavor, either "vv_fire" or "ase_fire" (default)
 
     Returns:
         tuple: A pair of functions:
@@ -722,7 +722,7 @@ def unit_cell_fire(
     constant_volume: bool = False,
     scalar_pressure: float = 0.0,
     maxstep: float = 0.2,
-    md_flavor: str = "ase_fire",
+    md_flavor: MdFlavor = ase_fire_key,
 ) -> tuple[
     UnitCellFireState,
     Callable[[UnitCellFireState], UnitCellFireState],
@@ -750,7 +750,7 @@ def unit_cell_fire(
         constant_volume (bool): Whether to maintain constant volume during optimization
         scalar_pressure (float): Applied external pressure in GPa
         maxstep (float): Maximum allowed step size for ase_fire
-        md_flavor (str): Optimization flavor, either "vv_fire" or "ase_fire" (default)
+        md_flavor (MdFlavor): Optimization flavor, either "vv_fire" or "ase_fire" (default)
 
     Returns:
         tuple: A pair of functions:
@@ -1017,7 +1017,7 @@ def frechet_cell_fire(
     constant_volume: bool = False,
     scalar_pressure: float = 0.0,
     maxstep: float = 0.2,
-    md_flavor: MdFlavor = vv_fire_key,
+    md_flavor: MdFlavor = ase_fire_key,
 ) -> tuple[
     FrechetCellFIREState,
     Callable[[FrechetCellFIREState], FrechetCellFIREState],
@@ -1046,7 +1046,7 @@ def frechet_cell_fire(
         constant_volume (bool): Whether to maintain constant volume during optimization
         scalar_pressure (float): Applied external pressure in GPa
         maxstep (float): Maximum allowed step size for ase_fire
-        md_flavor (str): Optimization flavor, either "vv_fire" or "ase_fire" (default)
+        md_flavor (MdFlavor): Optimization flavor, either "vv_fire" or "ase_fire" (default)
 
     Returns:
         tuple: A pair of functions:
