@@ -9,18 +9,17 @@ Comparing the ASE and VV FIRE optimizers.
 # ///
 
 import os
-import time # Added for timing
+import time
 
 import numpy as np
 import torch
-import torch_sim as ts
 from ase.build import bulk
 from mace.calculators.foundations_models import mace_mp
 
-from torch_sim.state import SimState
+import torch_sim as ts
 from torch_sim.models.mace import MaceModel
 from torch_sim.optimizers import fire
-from torch_sim.runners import InFlightAutoBatcher
+from torch_sim.state import SimState
 
 
 # Set device, data type and unit conversion
@@ -57,18 +56,18 @@ fe_dc.positions += 0.3 * rng.standard_normal(fe_dc.positions.shape)
 
 si_dc_vac = si_dc.copy()
 si_dc_vac.positions += 0.3 * rng.standard_normal(si_dc_vac.positions.shape)
-#select 2 numbers in range 0 to len(si_dc_vac)
+# select 2 numbers in range 0 to len(si_dc_vac)
 indices = rng.choice(len(si_dc_vac), size=2, replace=False)
-for i in indices:
-    si_dc_vac.pop(i)
+for idx in indices:
+    si_dc_vac.pop(idx)
 
 
 cu_dc_vac = cu_dc.copy()
 cu_dc_vac.positions += 0.3 * rng.standard_normal(cu_dc_vac.positions.shape)
-#remove 2 atoms from cu_dc_vac at random
+# remove 2 atoms from cu_dc_vac at random
 indices = rng.choice(len(cu_dc_vac), size=2, replace=False)
-for i in indices:
-    index = i + 3
+for idx in indices:
+    index = idx + 3
     if index < len(cu_dc_vac):
         cu_dc_vac.pop(index)
     else:
@@ -77,10 +76,10 @@ for i in indices:
 
 fe_dc_vac = fe_dc.copy()
 fe_dc_vac.positions += 0.3 * rng.standard_normal(fe_dc_vac.positions.shape)
-#remove 2 atoms from fe_dc_vac at random
+# remove 2 atoms from fe_dc_vac at random
 indices = rng.choice(len(fe_dc_vac), size=2, replace=False)
-for i in indices:
-    index = i + 2
+for idx in indices:
+    index = idx + 2
     if index < len(fe_dc_vac):
         fe_dc_vac.pop(index)
     else:
@@ -111,111 +110,132 @@ model = MaceModel(
 state = ts.io.atoms_to_state(atoms_list, device=device, dtype=dtype)
 # Run initial inference
 results = model(state)
-initial_energies = results['energy'] # Store initial energies
+initial_energies = results["energy"]  # Store initial energies
 
 
-def run_optimization(initial_state: SimState, md_flavor: str, force_tol: float = 0.05):
+def run_optimization(
+    initial_state: SimState, md_flavor: str, force_tol: float = 0.05
+) -> tuple[torch.Tensor, SimState]:
     """Runs FIRE optimization and returns convergence steps."""
-    print(f"\\n--- Running optimization with MD Flavor: {md_flavor} ---")
-    start_time = time.time()
+    print(f"\n--- Running optimization with MD Flavor: {md_flavor} ---")
+    start_time = time.perf_counter()
 
     # Re-initialize state and optimizer for this run
     init_fn, update_fn = fire(
         model=model,
         md_flavor=md_flavor,
     )
-    fire_state = init_fn(initial_state.clone()) # Use a clone to start fresh
+    fire_state = init_fn(initial_state.clone())  # Use a clone to start fresh
 
     batcher = ts.InFlightAutoBatcher(
         model=model,
         memory_scales_with="n_atoms",
         max_memory_scaler=1000,
-        max_iterations=1000, # Increased max iterations
-        return_indices=True # Ensure indices are returned
+        max_iterations=1000,  # Increased max iterations
+        return_indices=True,  # Ensure indices are returned
     )
 
     batcher.load_states(fire_state)
 
     total_structures = fire_state.n_batches
     # Initialize convergence steps tensor (-1 means not converged yet)
-    convergence_steps = torch.full((total_structures,), -1, dtype=torch.long, device=device)
+    convergence_steps = torch.full(
+        (total_structures,), -1, dtype=torch.long, device=device
+    )
     convergence_fn = ts.generate_force_convergence_fn(force_tol=force_tol)
 
-    converged_tensor_global = torch.zeros(total_structures, dtype=torch.bool, device=device)
+    converged_tensor_global = torch.zeros(
+        total_structures, dtype=torch.bool, device=device
+    )
     global_step = 0
-    all_converged_states = [] # Initialize list to store completed states
-    convergence_tensor_for_batcher = None # Initialize convergence tensor for batcher
+    all_converged_states = []  # Initialize list to store completed states
+    convergence_tensor_for_batcher = None  # Initialize convergence tensor for batcher
 
     # Keep track of the last valid state for final collection
     last_active_state = fire_state
 
-    while True: # Loop until batcher indicates completion
+    while True:  # Loop until batcher indicates completion
         # Get the next batch, passing the convergence status
         result = batcher.next_batch(last_active_state, convergence_tensor_for_batcher)
 
         fire_state, converged_states_from_batcher, current_indices_list = result
-        all_converged_states.extend(converged_states_from_batcher) # Add newly completed states
+        all_converged_states.extend(
+            converged_states_from_batcher
+        )  # Add newly completed states
 
-        if fire_state is None: # No more active states
-            print("All structures converged or max iterations reached by batcher.")
+        if fire_state is None:  # No more active states
+            print("All structures converged or batcher reached max iterations.")
             break
 
-        last_active_state = fire_state # Store the current active state
+        last_active_state = fire_state  # Store the current active state
 
         # Get the original indices of the current active batch as a tensor
-        current_indices = torch.tensor(current_indices_list, dtype=torch.long, device=device)
+        current_indices = torch.tensor(
+            current_indices_list, dtype=torch.long, device=device
+        )
 
         # Optimize the current batch
         steps_this_round = 10
         for _ in range(steps_this_round):
             fire_state = update_fn(fire_state)
-        global_step += steps_this_round # Increment global step count
+        global_step += steps_this_round  # Increment global step count
 
         # Check convergence *within the active batch*
         convergence_tensor_for_batcher = convergence_fn(fire_state, None)
 
         # Update global convergence status and steps
         # Identify structures in this batch that just converged
-        newly_converged_mask_local = convergence_tensor_for_batcher & (convergence_steps[current_indices] == -1)
+        newly_converged_mask_local = convergence_tensor_for_batcher & (
+            convergence_steps[current_indices] == -1
+        )
         converged_indices_global = current_indices[newly_converged_mask_local]
 
         if converged_indices_global.numel() > 0:
-            convergence_steps[converged_indices_global] = global_step # Mark convergence step
+            # Mark convergence step
+            convergence_steps[converged_indices_global] = global_step
             converged_tensor_global[converged_indices_global] = True
-            print(f"Step {global_step}: Converged indices {converged_indices_global.tolist()}. Total converged: {converged_tensor_global.sum().item()}/{total_structures}")
+            converged_indices = converged_indices_global.tolist()
 
+            total_converged = converged_tensor_global.sum().item() / total_structures
+            print(f"{global_step=}: {converged_indices=}, {total_converged=:.2%}")
 
         # Optional: Print progress
-        if global_step % 50 == 0: # Reduced frequency
-             print(f"Step {global_step}: Active structures: {fire_state.n_batches if fire_state else 0}, Total converged: {converged_tensor_global.sum().item()}/{total_structures}")
+        if global_step % 50 == 0:  # Reduced frequency
+            total_converged = converged_tensor_global.sum().item() / total_structures
+            active_structures = fire_state.n_batches if fire_state else 0
+            print(f"{global_step=}: {active_structures=}, {total_converged=:.2%}")
 
     # After the loop, collect any remaining states that were active in the last batch
     # result[1] contains states completed *before* the last next_batch call.
     # We need the states that were active *in* the last batch returned by next_batch
-    # If fire_state was the last active state, we might need to add it if batcher didn't mark it complete.
-    # However, restore_original_order should handle all collected states correctly.
+    # If fire_state was the last active state, we might need to add it if batcher didn't
+    # mark it complete. However, restore_original_order should handle all collected states
+    # correctly.
 
     # Restore original order and concatenate
     final_states_list = batcher.restore_original_order(all_converged_states)
     final_state_concatenated = ts.concatenate_states(final_states_list)
 
-    end_time = time.time()
+    end_time = time.perf_counter()
     print(f"Finished {md_flavor} in {end_time - start_time:.2f} seconds.")
     # Return both convergence steps and the final state object
     return convergence_steps, final_state_concatenated
+
 
 # --- Main Script ---
 force_tolerance = 0.05
 
 # Run with ase_fire
-ase_steps, ase_final_state = run_optimization(state.clone(), "ase_fire", force_tol=force_tolerance)
-
+ase_steps, ase_final_state = run_optimization(
+    state.clone(), "ase_fire", force_tol=force_tolerance
+)
 # Run with vv_fire
-vv_steps, vv_final_state = run_optimization(state.clone(), "vv_fire", force_tol=force_tolerance)
+vv_steps, vv_final_state = run_optimization(
+    state.clone(), "vv_fire", force_tol=force_tolerance
+)
 
-
-print("\\n--- Comparison ---")
-print(f"Force tolerance: {force_tolerance} eV/Å")
+print("\n--- Comparison ---")
+print(f"{force_tolerance=:.2f} eV/Å")
 
 # Extract final energies
 ase_final_energies = ase_final_state.energy
@@ -225,9 +245,9 @@ vv_final_energies = vv_final_state.energy
 ase_final_states_list = ase_final_state.split()
 vv_final_states_list = vv_final_state.split()
 mean_displacements = []
-for i in range(len(ase_final_states_list)):
-    ase_pos = ase_final_states_list[i].positions
-    vv_pos = vv_final_states_list[i].positions
+for idx in range(len(ase_final_states_list)):
+    ase_pos = ase_final_states_list[idx].positions
+    vv_pos = vv_final_states_list[idx].positions
     displacement = torch.norm(ase_pos - vv_pos, dim=1)
     mean_disp = torch.mean(displacement).item()
     mean_displacements.append(mean_disp)
