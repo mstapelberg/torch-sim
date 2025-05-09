@@ -12,6 +12,9 @@ The module offers:
 * FIRE (Fast Inertial Relaxation Engine) optimization with unit cell parameters
 * FIRE optimization with Frechet cell parameterization for improved cell relaxation
 
+ASE-style FIRE: https://gitlab.com/ase/ase/-/blob/master/ase/optimize/fire.py?ref_type=heads 
+Velocity Verlet-style FIRE: https://doi.org/10.1103/PhysRevLett.97.170201
+
 """
 
 import functools
@@ -490,7 +493,7 @@ def fire(
     alpha_start: float = 0.1,
     f_alpha: float = 0.99,
     maxstep: float = 0.2,
-    md_flavor: MdFlavor = vv_fire_key,
+    md_flavor: str = "ase_fire",
 ) -> tuple[
     Callable[[SimState | StateDict], FireState],
     Callable[[FireState], FireState],
@@ -510,10 +513,8 @@ def fire(
         alpha_start (float): Initial velocity mixing parameter
         f_alpha (float): Factor for mixing parameter decrease
         maxstep (float): Maximum distance an atom can move per iteration (default
-            value is 0.2). Only used when md_flavor="ase_fire".
-        md_flavor ("vv_fire" | "ase_fire"): The type of molecular dynamics flavor to run.
-            Options are "vv_fire" (default, based on original paper and Velocity Verlet)
-            or "ase_fire" (mimics ASE's FIRE implementation).
+            value is 0.2). Only used when md_flavor='ase_fire'.
+        md_flavor (str): Optimization flavor, either "vv_fire" or "ase_fire" (default)
 
     Returns:
         tuple: A pair of functions:
@@ -721,7 +722,7 @@ def unit_cell_fire(
     constant_volume: bool = False,
     scalar_pressure: float = 0.0,
     maxstep: float = 0.2,
-    md_flavor: MdFlavor = vv_fire_key,
+    md_flavor: str = "ase_fire",
 ) -> tuple[
     UnitCellFireState,
     Callable[[UnitCellFireState], UnitCellFireState],
@@ -749,7 +750,7 @@ def unit_cell_fire(
         constant_volume (bool): Whether to maintain constant volume during optimization
         scalar_pressure (float): Applied external pressure in GPa
         maxstep (float): Maximum allowed step size for ase_fire
-        md_flavor ("vv_fire" | "ase_fire"): Optimization flavor
+        md_flavor (str): Optimization flavor, either "vv_fire" or "ase_fire" (default)
 
     Returns:
         tuple: A pair of functions:
@@ -1045,7 +1046,7 @@ def frechet_cell_fire(
         constant_volume (bool): Whether to maintain constant volume during optimization
         scalar_pressure (float): Applied external pressure in GPa
         maxstep (float): Maximum allowed step size for ase_fire
-        md_flavor ("vv_fire" | "ase_fire"): Optimization flavor
+        md_flavor (str): Optimization flavor, either "vv_fire" or "ase_fire" (default)
 
     Returns:
         tuple: A pair of functions:
