@@ -310,7 +310,7 @@ def fire(
     return fire_init, fire_update
 
 
-def fire_ase(  # noqa: PLR0915
+def fire_ase(  # noqa: C901, PLR0915
     *,
     model: torch.nn.Module,
     dt: float = 0.1,
@@ -585,10 +585,10 @@ def unit_cell_fire(  # noqa: PLR0915, C901
     eps = 1e-8 if dtype == torch.float32 else 1e-16
 
     # Setup parameters
-    params = [dt_max, dt_start, alpha_start, f_inc, f_dec, f_alpha, n_min]
-    dt_max, dt_start, alpha_start, f_inc, f_dec, f_alpha, n_min = [
-        torch.as_tensor(p, device=device, dtype=dtype) for p in params
-    ]
+    dt_max, dt_start, alpha_start, f_inc, f_dec, f_alpha, n_min = (
+        torch.as_tensor(p, device=device, dtype=dtype)
+        for p in (dt_max, dt_start, alpha_start, f_inc, f_dec, f_alpha, n_min)
+    )
 
     def fire_init(
         state: SimState | StateDict,
@@ -894,10 +894,10 @@ def frechet_cell_fire(  # noqa: PLR0915, C901
     eps = 1e-8 if dtype == torch.float32 else 1e-16
 
     # Setup parameters
-    params = [dt_max, dt_start, alpha_start, f_inc, f_dec, f_alpha]
-    dt_max, dt_start, alpha_start, f_inc, f_dec, f_alpha = [
-        torch.as_tensor(p, device=device, dtype=dtype) for p in params
-    ]
+    dt_max, dt_start, alpha_start, f_inc, f_dec, f_alpha = (
+        torch.as_tensor(p, device=device, dtype=dtype)
+        for p in (dt_max, dt_start, alpha_start, f_inc, f_dec, f_alpha)
+    )
 
     def fire_init(
         state: SimState | StateDict,

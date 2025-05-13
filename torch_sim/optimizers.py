@@ -492,7 +492,7 @@ def fire(
     f_dec: float = 0.5,
     alpha_start: float = 0.1,
     f_alpha: float = 0.99,
-    maxstep: float = 0.2,
+    max_step: float = 0.2,
     md_flavor: MdFlavor = ase_fire_key,
 ) -> tuple[
     Callable[[SimState | StateDict], FireState],
@@ -512,7 +512,7 @@ def fire(
         f_dec (float): Factor for timestep decrease when power is negative
         alpha_start (float): Initial velocity mixing parameter
         f_alpha (float): Factor for mixing parameter decrease
-        maxstep (float): Maximum distance an atom can move per iteration (default
+        max_step (float): Maximum distance an atom can move per iteration (default
             value is 0.2). Only used when md_flavor='ase_fire'.
         md_flavor (MdFlavor): Optimization flavor, either "vv_fire" or "ase_fire".
             Default is "ase_fire".
@@ -541,11 +541,11 @@ def fire(
 
     eps = 1e-8 if dtype == torch.float32 else 1e-16
 
-    # Setup parameters, added maxstep for ASE style
-    params = [dt_max, dt_start, alpha_start, f_inc, f_dec, f_alpha, n_min, maxstep]
-    dt_max, dt_start, alpha_start, f_inc, f_dec, f_alpha, n_min, maxstep = [
-        torch.as_tensor(p, device=device, dtype=dtype) for p in params
-    ]
+    # Setup parameters, added max_step for ASE style
+    dt_max, dt_start, alpha_start, f_inc, f_dec, f_alpha, n_min, max_step = (
+        torch.as_tensor(p, device=device, dtype=dtype)
+        for p in (dt_max, dt_start, alpha_start, f_inc, f_dec, f_alpha, n_min, max_step)
+    )
 
     def fire_init(
         state: SimState | StateDict,
@@ -577,11 +577,9 @@ def fire(
         # Setup parameters
         dt_start = torch.full((n_batches,), dt_start, device=device, dtype=dtype)
         alpha_start = torch.full((n_batches,), alpha_start, device=device, dtype=dtype)
-
         n_pos = torch.zeros((n_batches,), device=device, dtype=torch.int32)
 
-        # Create initial state
-        return FireState(
+        return FireState(  # Create initial state
             # Copy SimState attributes
             positions=state.positions.clone(),
             masses=state.masses.clone(),
@@ -621,7 +619,7 @@ def fire(
         f_dec=f_dec,
         alpha_start_val=alpha_start,
         f_alpha=f_alpha,
-        maxstep=maxstep,
+        max_step=max_step,
         eps=eps,
         is_cell_optimization=False,
         is_frechet=False,
@@ -722,7 +720,7 @@ def unit_cell_fire(
     hydrostatic_strain: bool = False,
     constant_volume: bool = False,
     scalar_pressure: float = 0.0,
-    maxstep: float = 0.2,
+    max_step: float = 0.2,
     md_flavor: MdFlavor = ase_fire_key,
 ) -> tuple[
     UnitCellFireState,
@@ -750,7 +748,7 @@ def unit_cell_fire(
             (isotropic scaling)
         constant_volume (bool): Whether to maintain constant volume during optimization
         scalar_pressure (float): Applied external pressure in GPa
-        maxstep (float): Maximum allowed step size for ase_fire
+        max_step (float): Maximum allowed step size for ase_fire
         md_flavor (MdFlavor): Optimization flavor, either "vv_fire" or "ase_fire".
             Default is "ase_fire".
 
@@ -776,10 +774,10 @@ def unit_cell_fire(
     eps = 1e-8 if dtype == torch.float32 else 1e-16
 
     # Setup parameters
-    params = [dt_max, dt_start, alpha_start, f_inc, f_dec, f_alpha, n_min, maxstep]
-    dt_max, dt_start, alpha_start, f_inc, f_dec, f_alpha, n_min, maxstep = [
-        torch.as_tensor(p, device=device, dtype=dtype) for p in params
-    ]
+    dt_max, dt_start, alpha_start, f_inc, f_dec, f_alpha, n_min, max_step = (
+        torch.as_tensor(p, device=device, dtype=dtype)
+        for p in (dt_max, dt_start, alpha_start, f_inc, f_dec, f_alpha, n_min, max_step)
+    )
 
     def fire_init(
         state: SimState | StateDict,
@@ -862,11 +860,9 @@ def unit_cell_fire(
         # Setup parameters
         dt_start = torch.full((n_batches,), dt_start, device=device, dtype=dtype)
         alpha_start = torch.full((n_batches,), alpha_start, device=device, dtype=dtype)
-
         n_pos = torch.zeros((n_batches,), device=device, dtype=torch.int32)
 
-        # Create initial state
-        return UnitCellFireState(
+        return UnitCellFireState(  # Create initial state
             # Copy SimState attributes
             positions=state.positions.clone(),
             masses=state.masses.clone(),
@@ -917,7 +913,7 @@ def unit_cell_fire(
         f_dec=f_dec,
         alpha_start_val=alpha_start,
         f_alpha=f_alpha,
-        maxstep=maxstep,
+        max_step=max_step,
         eps=eps,
         is_cell_optimization=True,
         is_frechet=False,
@@ -1018,7 +1014,7 @@ def frechet_cell_fire(
     hydrostatic_strain: bool = False,
     constant_volume: bool = False,
     scalar_pressure: float = 0.0,
-    maxstep: float = 0.2,
+    max_step: float = 0.2,
     md_flavor: MdFlavor = ase_fire_key,
 ) -> tuple[
     FrechetCellFIREState,
@@ -1047,7 +1043,7 @@ def frechet_cell_fire(
             (isotropic scaling)
         constant_volume (bool): Whether to maintain constant volume during optimization
         scalar_pressure (float): Applied external pressure in GPa
-        maxstep (float): Maximum allowed step size for ase_fire
+        max_step (float): Maximum allowed step size for ase_fire
         md_flavor (MdFlavor): Optimization flavor, either "vv_fire" or "ase_fire".
             Default is "ase_fire".
 
@@ -1072,10 +1068,10 @@ def frechet_cell_fire(
     eps = 1e-8 if dtype == torch.float32 else 1e-16
 
     # Setup parameters
-    params = [dt_max, dt_start, alpha_start, f_inc, f_dec, f_alpha, n_min, maxstep]
-    dt_max, dt_start, alpha_start, f_inc, f_dec, f_alpha, n_min, maxstep = [
-        torch.as_tensor(p, device=device, dtype=dtype) for p in params
-    ]
+    dt_max, dt_start, alpha_start, f_inc, f_dec, f_alpha, n_min, max_step = (
+        torch.as_tensor(p, device=device, dtype=dtype)
+        for p in (dt_max, dt_start, alpha_start, f_inc, f_dec, f_alpha, n_min, max_step)
+    )
 
     def fire_init(
         state: SimState | StateDict,
@@ -1175,8 +1171,7 @@ def frechet_cell_fire(
         alpha_start = torch.full((n_batches,), alpha_start, device=device, dtype=dtype)
         n_pos = torch.zeros((n_batches,), device=device, dtype=torch.int32)
 
-        # Create initial state
-        return FrechetCellFIREState(
+        return FrechetCellFIREState(  # Create initial state
             # Copy SimState attributes
             positions=state.positions,
             masses=state.masses,
@@ -1227,7 +1222,7 @@ def frechet_cell_fire(
         f_dec=f_dec,
         alpha_start_val=alpha_start,
         f_alpha=f_alpha,
-        maxstep=maxstep,
+        max_step=max_step,
         eps=eps,
         is_cell_optimization=True,
         is_frechet=True,
@@ -1453,7 +1448,7 @@ def _ase_fire_step(  # noqa: C901, PLR0915
     f_dec: torch.Tensor,
     alpha_start_val: torch.Tensor,
     f_alpha: torch.Tensor,
-    maxstep: torch.Tensor,
+    max_step: torch.Tensor,
     eps: float,
     is_cell_optimization: bool = False,
     is_frechet: bool = False,
@@ -1473,7 +1468,7 @@ def _ase_fire_step(  # noqa: C901, PLR0915
         f_dec: Factor for timestep decrease when power is negative.
         alpha_start_val: Initial mixing parameter for velocity update.
         f_alpha: Factor for mixing parameter decrease.
-        maxstep: Maximum allowed step size.
+        max_step: Maximum allowed step size.
         eps: Small epsilon value for numerical stability.
         is_cell_optimization: Flag indicating if cell optimization is active.
         is_frechet: Flag indicating if Frechet cell parameterization is used.
@@ -1560,27 +1555,27 @@ def _ase_fire_step(  # noqa: C901, PLR0915
         assert isinstance(state, (UnitCellFireState, FrechetCellFIREState))
         dr_cell = cell_dt * state.cell_velocities
 
-    # 6. Clamp to maxstep
+    # 6. Clamp to max_step
     # Atoms
     dr_norm_atom = torch.norm(dr_atom, dim=1, keepdim=True)
-    mask_atom_maxstep = dr_norm_atom > maxstep
+    mask_atom_max_step = dr_norm_atom > max_step
     dr_atom = torch.where(
-        mask_atom_maxstep, maxstep * dr_atom / (dr_norm_atom + eps), dr_atom
+        mask_atom_max_step, max_step * dr_atom / (dr_norm_atom + eps), dr_atom
     )
 
     if is_cell_optimization:
         assert isinstance(state, (UnitCellFireState, FrechetCellFIREState))
-        # Cell clamp to maxstep (Frobenius norm)
+        # Cell clamp to max_step (Frobenius norm)
         dr_cell_norm_fro = torch.norm(dr_cell.view(n_batches, -1), dim=1, keepdim=True)
-        mask_cell_maxstep = dr_cell_norm_fro.view(n_batches, 1, 1) > maxstep
+        mask_cell_max_step = dr_cell_norm_fro.view(n_batches, 1, 1) > max_step
         dr_cell = torch.where(
-            mask_cell_maxstep,
-            maxstep * dr_cell / (dr_cell_norm_fro.view(n_batches, 1, 1) + eps),
+            mask_cell_max_step,
+            max_step * dr_cell / (dr_cell_norm_fro.view(n_batches, 1, 1) + eps),
             dr_cell,
         )
 
     # 7. Position / cell update
-    state.positions += dr_atom
+    state.positions = state.positions + dr_atom
 
     # F_new stores F_new for Frechet's ucf_cell_grad if needed
     F_new: torch.Tensor | None = None

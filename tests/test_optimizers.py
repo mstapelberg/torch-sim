@@ -224,7 +224,7 @@ def test_fire_ase_negative_power_branch(
         alpha_start=alpha_start_val,
         dt_start=dt_start_val,
         dt_max=1.0,
-        maxstep=10.0,  # Large maxstep to not interfere with velocity check
+        max_step=10.0,  # Large max_step to not interfere with velocity check
     )
     # Initialize state (forces are computed here)
     state = init_fn(ar_supercell_sim_state)
@@ -511,7 +511,7 @@ def test_unit_cell_fire_ase_non_positive_volume_warning(
         model=lj_model,
         md_flavor="ase_fire",
         dt_max=5.0,  # Large dt
-        maxstep=2.0,  # Large maxstep
+        max_step=2.0,  # Large max_step
         dt_start=1.0,
         f_dec=0.99,  # Slow down dt decrease
         alpha_start=0.99,  # Aggressive alpha
