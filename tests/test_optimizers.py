@@ -630,20 +630,7 @@ def test_frechet_cell_fire_optimization(
     )
 
 
-@pytest.mark.parametrize(
-    "optimizer_func",
-    [
-        fire,
-        unit_cell_fire,
-        pytest.param(
-            frechet_cell_fire,
-            marks=pytest.mark.xfail(
-                reason="frechet_cell_fire with ase_fire flavor shows asymmetry in "
-                "batched mode, batch 0 stalls."
-            ),
-        ),
-    ],
-)
+@pytest.mark.parametrize("optimizer_func", [fire, unit_cell_fire, frechet_cell_fire])
 def test_optimizer_batch_consistency(
     optimizer_func: callable,
     ar_supercell_sim_state: SimState,
