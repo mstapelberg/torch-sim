@@ -214,14 +214,14 @@ def test_fire_ase_negative_power_branch(
 ) -> None:
     """Test that the ASE FIRE P<0 branch behaves as expected."""
     f_dec = 0.5  # Default from fire optimizer
-    alpha_start_val = 0.1  # Default from fire optimizer
+    alpha_start = 0.1  # Default from fire optimizer
     dt_start_val = 0.1
 
     init_fn, update_fn = fire(
         model=lj_model,
         md_flavor="ase_fire",
         f_dec=f_dec,
-        alpha_start=alpha_start_val,
+        alpha_start=alpha_start,
         dt_start=dt_start_val,
         dt_max=1.0,
         max_step=10.0,  # Large max_step to not interfere with velocity check
@@ -253,7 +253,7 @@ def test_fire_ase_negative_power_branch(
     assert torch.allclose(
         updated_state.alpha[0],
         torch.tensor(
-            alpha_start_val,
+            alpha_start,
             dtype=updated_state.alpha.dtype,
             device=updated_state.alpha.device,
         ),
@@ -277,7 +277,7 @@ def test_fire_vv_negative_power_branch(
 ) -> None:
     """Attempt to trigger and test the VV FIRE P<0 branch."""
     f_dec = 0.5
-    alpha_start_val = 0.1
+    alpha_start = 0.1
     # Use a very large dt_start to encourage overshooting and P<0 inside _vv_fire_step
     dt_start_val = 2.0
     dt_max_val = 2.0
@@ -286,7 +286,7 @@ def test_fire_vv_negative_power_branch(
         model=lj_model,
         md_flavor="vv_fire",
         f_dec=f_dec,
-        alpha_start=alpha_start_val,
+        alpha_start=alpha_start,
         dt_start=dt_start_val,
         dt_max=dt_max_val,
         n_min=0,  # Allow dt to change immediately
@@ -294,7 +294,7 @@ def test_fire_vv_negative_power_branch(
     state = init_fn(ar_supercell_sim_state)
 
     initial_dt_batch = state.dt.clone()
-    initial_alpha_batch = state.alpha.clone()  # Already alpha_start_val
+    initial_alpha_batch = state.alpha.clone()  # Already alpha_start
     initial_n_pos_batch = state.n_pos.clone()  # Already 0
 
     state_to_update = copy.deepcopy(state)
@@ -303,7 +303,7 @@ def test_fire_vv_negative_power_branch(
     # Check if the P<0 branch was likely hit (params changed accordingly for batch 0)
     expected_dt_val = initial_dt_batch[0] * f_dec
     expected_alpha_val = torch.tensor(
-        alpha_start_val,
+        alpha_start,
         dtype=initial_alpha_batch.dtype,
         device=initial_alpha_batch.device,
     )
@@ -320,7 +320,7 @@ def test_fire_vv_negative_power_branch(
             f"dt: {initial_dt_batch[0].item():.4f} -> {updated_state.dt[0].item():.4f} "
             f"(expected factor {f_dec}). "
             f"alpha: {initial_alpha_batch[0].item():.4f} -> "
-            f"{updated_state.alpha[0].item():.4f} (expected {alpha_start_val}). "
+            f"{updated_state.alpha[0].item():.4f} (expected {alpha_start}). "
             f"n_pos: {initial_n_pos_batch[0].item()} -> {updated_state.n_pos[0].item()} "
             "(expected 0)."
         )

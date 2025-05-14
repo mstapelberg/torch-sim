@@ -597,38 +597,22 @@ def fire(
             n_pos=n_pos,
         )
 
-    vv_fire_step_func = functools.partial(
-        _vv_fire_step,
+    step_func_kwargs = dict(
         model=model,
         dt_max=dt_max,
         n_min=n_min,
         f_inc=f_inc,
         f_dec=f_dec,
-        alpha_start_val=alpha_start,
+        alpha_start=alpha_start,
         f_alpha=f_alpha,
         eps=eps,
         is_cell_optimization=False,
         is_frechet=False,
     )
-    ase_fire_step_func = functools.partial(
-        _ase_fire_step,
-        model=model,
-        dt_max=dt_max,
-        n_min=n_min,
-        f_inc=f_inc,
-        f_dec=f_dec,
-        alpha_start_val=alpha_start,
-        f_alpha=f_alpha,
-        max_step=max_step,
-        eps=eps,
-        is_cell_optimization=False,
-        is_frechet=False,
-    )
-    step_func = {
-        vv_fire_key: vv_fire_step_func,
-        ase_fire_key: ase_fire_step_func,
-    }[md_flavor]
-    return fire_init, step_func
+    if md_flavor == ase_fire_key:
+        step_func_kwargs["max_step"] = max_step
+    step_func = {vv_fire_key: _vv_fire_step, ase_fire_key: _ase_fire_step}[md_flavor]
+    return fire_init, functools.partial(step_func, **step_func_kwargs)
 
 
 @dataclass
@@ -891,38 +875,22 @@ def unit_cell_fire(
             constant_volume=constant_volume,
         )
 
-    vv_fire_step_func = functools.partial(
-        _vv_fire_step,
+    step_func_kwargs = dict(
         model=model,
         dt_max=dt_max,
         n_min=n_min,
         f_inc=f_inc,
         f_dec=f_dec,
-        alpha_start_val=alpha_start,
+        alpha_start=alpha_start,
         f_alpha=f_alpha,
         eps=eps,
         is_cell_optimization=True,
         is_frechet=False,
     )
-    ase_fire_step_func = functools.partial(
-        _ase_fire_step,
-        model=model,
-        dt_max=dt_max,
-        n_min=n_min,
-        f_inc=f_inc,
-        f_dec=f_dec,
-        alpha_start_val=alpha_start,
-        f_alpha=f_alpha,
-        max_step=max_step,
-        eps=eps,
-        is_cell_optimization=True,
-        is_frechet=False,
-    )
-    step_func = {
-        vv_fire_key: vv_fire_step_func,
-        ase_fire_key: ase_fire_step_func,
-    }[md_flavor]
-    return fire_init, step_func
+    if md_flavor == ase_fire_key:
+        step_func_kwargs["max_step"] = max_step
+    step_func = {vv_fire_key: _vv_fire_step, ase_fire_key: _ase_fire_step}[md_flavor]
+    return fire_init, functools.partial(step_func, **step_func_kwargs)
 
 
 @dataclass
@@ -1200,38 +1168,22 @@ def frechet_cell_fire(
             constant_volume=constant_volume,
         )
 
-    vv_fire_step_func = functools.partial(
-        _vv_fire_step,
+    step_func_kwargs = dict(
         model=model,
         dt_max=dt_max,
         n_min=n_min,
         f_inc=f_inc,
         f_dec=f_dec,
-        alpha_start_val=alpha_start,
+        alpha_start=alpha_start,
         f_alpha=f_alpha,
         eps=eps,
         is_cell_optimization=True,
         is_frechet=True,
     )
-    ase_fire_step_func = functools.partial(
-        _ase_fire_step,
-        model=model,
-        dt_max=dt_max,
-        n_min=n_min,
-        f_inc=f_inc,
-        f_dec=f_dec,
-        alpha_start_val=alpha_start,
-        f_alpha=f_alpha,
-        max_step=max_step,
-        eps=eps,
-        is_cell_optimization=True,
-        is_frechet=True,
-    )
-    step_func = {
-        vv_fire_key: vv_fire_step_func,
-        ase_fire_key: ase_fire_step_func,
-    }[md_flavor]
-    return fire_init, step_func
+    if md_flavor == ase_fire_key:
+        step_func_kwargs["max_step"] = max_step
+    step_func = {vv_fire_key: _vv_fire_step, ase_fire_key: _ase_fire_step}[md_flavor]
+    return fire_init, functools.partial(step_func, **step_func_kwargs)
 
 
 def _vv_fire_step(  # noqa: C901, PLR0915
@@ -1242,7 +1194,7 @@ def _vv_fire_step(  # noqa: C901, PLR0915
     n_min: torch.Tensor,
     f_inc: torch.Tensor,
     f_dec: torch.Tensor,
-    alpha_start_val: torch.Tensor,
+    alpha_start: torch.Tensor,
     f_alpha: torch.Tensor,
     eps: float,
     is_cell_optimization: bool = False,
@@ -1262,7 +1214,7 @@ def _vv_fire_step(  # noqa: C901, PLR0915
         n_min: Minimum steps before timestep increase.
         f_inc: Factor for timestep increase when power is positive.
         f_dec: Factor for timestep decrease when power is negative.
-        alpha_start_val: Initial mixing parameter for velocity update.
+        alpha_start: Initial mixing parameter for velocity update.
         f_alpha: Factor for mixing parameter decrease.
         eps: Small epsilon value for numerical stability.
         is_cell_optimization: Flag indicating if cell optimization is active.
@@ -1277,7 +1229,7 @@ def _vv_fire_step(  # noqa: C901, PLR0915
     deform_grad_new: torch.Tensor | None = None
 
     alpha_start_batch = torch.full(
-        (n_batches,), alpha_start_val.item(), device=device, dtype=dtype
+        (n_batches,), alpha_start.item(), device=device, dtype=dtype
     )
 
     atom_wise_dt = state.dt[state.batch].unsqueeze(-1)
@@ -1446,7 +1398,7 @@ def _ase_fire_step(  # noqa: C901, PLR0915
     n_min: torch.Tensor,
     f_inc: torch.Tensor,
     f_dec: torch.Tensor,
-    alpha_start_val: torch.Tensor,
+    alpha_start: torch.Tensor,
     f_alpha: torch.Tensor,
     max_step: torch.Tensor,
     eps: float,
@@ -1466,7 +1418,7 @@ def _ase_fire_step(  # noqa: C901, PLR0915
         n_min: Minimum steps before timestep increase.
         f_inc: Factor for timestep increase when power is positive.
         f_dec: Factor for timestep decrease when power is negative.
-        alpha_start_val: Initial mixing parameter for velocity update.
+        alpha_start: Initial mixing parameter for velocity update.
         f_alpha: Factor for mixing parameter decrease.
         max_step: Maximum allowed step size.
         eps: Small epsilon value for numerical stability.
@@ -1480,9 +1432,9 @@ def _ase_fire_step(  # noqa: C901, PLR0915
     n_batches = state.n_batches
 
     # Setup batch-wise alpha_start for potential reset
-    # alpha_start_val is a 0-dim tensor from the factory
+    # alpha_start is a 0-dim tensor from the factory
     alpha_start_batch = torch.full(
-        (n_batches,), alpha_start_val.item(), device=device, dtype=dtype
+        (n_batches,), alpha_start.item(), device=device, dtype=dtype
     )
 
     # 1. Current power (F·v) per batch (atoms + cell)
