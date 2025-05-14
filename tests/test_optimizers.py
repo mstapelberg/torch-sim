@@ -611,15 +611,16 @@ def test_frechet_cell_fire_optimization(
     pressure = torch.trace(state.stress.squeeze(0)) / 3.0
 
     # Adjust tolerances if needed, Frechet might behave slightly differently
-    pressure_tolerance = 0.01
-    force_tolerance = 0.2
+    pressure_tol = 0.01
+    force_tol = 0.2
 
-    assert torch.abs(pressure) < pressure_tolerance, (
-        f"{md_flavor=} pressure should be small after Frechet optimization, "
-        f"got {pressure.item()}"
+    assert torch.abs(pressure) < pressure_tol, (
+        f"{md_flavor=} pressure should be below {pressure_tol=} after Frechet "
+        f"optimization, got {pressure.item()}"
     )
-    assert max_force < force_tolerance, (
-        f"{md_flavor=} forces should be small after Frechet optimization, got {max_force}"
+    assert max_force < force_tol, (
+        f"{md_flavor=} forces should be below {force_tol=} after Frechet optimization, "
+        f"got {max_force}"
     )
 
     assert not torch.allclose(state.positions, initial_state_positions, atol=1e-5), (

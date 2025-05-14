@@ -109,8 +109,7 @@ model = MaceModel(
 # Convert atoms to state
 state = ts.io.atoms_to_state(atoms_list, device=device, dtype=dtype)
 # Run initial inference
-results = model(state)
-initial_energies = results["energy"]  # Store initial energies
+initial_energies = model(state)["energy"]
 
 
 def run_optimization(
@@ -223,23 +222,17 @@ def run_optimization(
 
 
 # --- Main Script ---
-force_tolerance = 0.05
+force_tol = 0.05
 
 # Run with ase_fire
 ase_steps, ase_final_state = run_optimization(
-    state.clone(), "ase_fire", force_tol=force_tolerance
+    state.clone(), "ase_fire", force_tol=force_tol
 )
 # Run with vv_fire
-vv_steps, vv_final_state = run_optimization(
-    state.clone(), "vv_fire", force_tol=force_tolerance
-)
+vv_steps, vv_final_state = run_optimization(state.clone(), "vv_fire", force_tol=force_tol)
 
 print("\n--- Comparison ---")
-print(f"{force_tolerance=:.2f} eV/Å")
-
-# Extract final energies
-ase_final_energies = ase_final_state.energy
-vv_final_energies = vv_final_state.energy
+print(f"{force_tol=:.2f} eV/Å")
 
 # Calculate Mean Position Displacements
 ase_final_states_list = ase_final_state.split()
@@ -254,8 +247,8 @@ for idx in range(len(ase_final_states_list)):
 
 
 print(f"Initial energies: {[f'{e.item():.3f}' for e in initial_energies]} eV")
-print(f"Final ASE energies: {[f'{e.item():.3f}' for e in ase_final_energies]} eV")
-print(f"Final VV energies:  {[f'{e.item():.3f}' for e in vv_final_energies]} eV")
+print(f"Final ASE energies: {[f'{e.item():.3f}' for e in ase_final_state.energy]} eV")
+print(f"Final VV energies:  {[f'{e.item():.3f}' for e in vv_final_state.energy]} eV")
 print(f"Mean Disp (ASE-VV): {[f'{d:.4f}' for d in mean_displacements]} Å")
 print(f"Convergence steps (ASE FIRE): {ase_steps.tolist()}")
 print(f"Convergence steps (VV FIRE):  {vv_steps.tolist()}")
