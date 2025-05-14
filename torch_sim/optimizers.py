@@ -518,19 +518,22 @@ def fire(
             Default is "ase_fire".
 
     Returns:
-        tuple: A pair of functions:
+        tuple[Callable, Callable]:
             - Initialization function that creates a FireState
             - Update function (either vv_fire_step or ase_fire_step) that performs
               one FIRE optimization step.
 
     Notes:
+        - md_flavor="vv_fire" follows the original paper closely, including
+          integration with Velocity Verlet steps. See https://doi.org/10.1103/PhysRevLett.97.170201
+          and https://github.com/Radical-AI/torch-sim/issues/90#issuecomment-2826179997
+          for details.
+        - md_flavor="ase_fire" mimics the implementation in ASE, which differs slightly
+          in the update steps and does not explicitly use atomic masses in the
+          velocity update step. See https://gitlab.com/ase/ase/-/blob/66963e6e38/ase/optimize/fire.py#L164-214
+          for details.
         - FIRE is generally more efficient than standard gradient descent for atomic
           structure optimization.
-        - The "vv_fire" flavor follows the original paper closely, including
-          integration with Velocity Verlet steps.
-        - The "ase_fire" flavor mimics the implementation in ASE, which differs slightly
-          in the update steps and does not explicitly use atomic masses in the
-          velocity update step.
         - The algorithm adaptively adjusts step sizes and mixing parameters based
           on the dot product of forces and velocities (power).
     """
@@ -742,6 +745,14 @@ def unit_cell_fire(
             - Update function that performs one FIRE optimization step
 
     Notes:
+        - md_flavor="vv_fire" follows the original paper closely, including
+          integration with Velocity Verlet steps. See https://doi.org/10.1103/PhysRevLett.97.170201
+          and https://github.com/Radical-AI/torch-sim/issues/90#issuecomment-2826179997
+          for details.
+        - md_flavor="ase_fire" mimics the implementation in ASE, which differs slightly
+          in the update steps and does not explicitly use atomic masses in the
+          velocity update step. See https://gitlab.com/ase/ase/-/blob/66963e6e38/ase/optimize/fire.py#L164-214
+          for details.
         - FIRE is generally more efficient than standard gradient descent for atomic
           structure optimization
         - The algorithm adaptively adjusts step sizes and mixing parameters based
@@ -1021,6 +1032,14 @@ def frechet_cell_fire(
             - Update function that performs one FIRE step with Frechet derivatives
 
     Notes:
+        - md_flavor="vv_fire" follows the original paper closely, including
+          integration with Velocity Verlet steps. See https://doi.org/10.1103/PhysRevLett.97.170201
+          and https://github.com/Radical-AI/torch-sim/issues/90#issuecomment-2826179997
+          for details.
+        - md_flavor="ase_fire" mimics the implementation in ASE, which differs slightly
+          in the update steps and does not explicitly use atomic masses in the
+          velocity update step. See https://gitlab.com/ase/ase/-/blob/66963e6e38/ase/optimize/fire.py#L164-214
+          for details.
         - Frechet cell parameterization uses matrix logarithm to represent cell
           deformations, which provides improved numerical properties for cell
           optimization
