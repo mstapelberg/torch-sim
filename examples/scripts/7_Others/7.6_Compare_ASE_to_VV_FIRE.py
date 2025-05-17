@@ -94,7 +94,7 @@ for idx in indices:
 
 
 # Create a list of our atomic systems
-atoms_list = [si_dc, cu_dc, fe_dc, si_dc_vac, cu_dc_vac]
+atoms_list = [si_dc, cu_dc, fe_dc, si_dc_vac, cu_dc_vac, fe_dc_vac]
 
 # Print structure information
 print(f"Silicon atoms: {len(si_dc)}")
@@ -484,70 +484,66 @@ for name1, name2 in comparison_pairs:
 
 # --- Plotting Results ---
 
-# Names for the 5 structures for plotting labels
-structure_names = [ats.get_chemical_formula() for ats in atoms_list]
+# Names for the structures for plotting labels
+original_structure_formulas = [ats.get_chemical_formula() for ats in atoms_list]
 # Make them more concise if needed:
-structure_names = ["Si_bulk", "Cu_bulk", "Fe_bulk", "Si_vac", "Cu_vac"] # Example concise names
+structure_names = ["Si_bulk", "Cu_bulk", "Fe_bulk", "Si_vac", "Cu_vac", "Fe_vac"] # Updated for 6 structures
+if len(structure_names) != len(atoms_list):
+    print(f"Warning: Mismatch between custom structure_names ({len(structure_names)}) and atoms_list ({len(atoms_list)}). Using custom names.")
 num_structures_plot = len(structure_names)
 
 
 # --- Plot 1: Convergence Steps (Multi-bar per structure) ---
 plot_methods_fig1 = list(results_all.keys())
 num_methods_fig1 = len(plot_methods_fig1)
-steps_data_fig1 = np.zeros((num_structures_plot, num_methods_fig1)) # rows: structures, cols: methods
+# Initialize with NaNs, so if a method fails completely, its bars are missing or clearly marked
+steps_data_fig1 = np.full((num_structures_plot, num_methods_fig1), np.nan) 
 
 for method_idx, method_name in enumerate(plot_methods_fig1):
     result_data = results_all[method_name]
-    if result_data["final_state"] is None:
-        steps_data_fig1[:, method_idx] = np.nan # Mark all as NaN for this method
-        print(f"Plot1: Skipping steps for {method_name} as final_state is None.")
+    if result_data["final_state"] is None or result_data["steps"] is None:
+        # steps_data_fig1[:, method_idx] = np.nan # Already initialized with NaN
+        print(f"Plot1: Skipping steps for {method_name} as final_state or steps is None.")
         continue
     
     steps_tensor = result_data["steps"].cpu().numpy()
-    # Replace -1 (not converged) with a high value for plotting, or handle differently
-    # For now, let's use a penalty (e.g., max_iterations_overall + buffer)
-    # or keep as -1 and let user interpret. For bar plot, positive values are better.
-    # Let's use np.nan for non-converged for now, and plot what did converge.
-    # Or, use ase_max_optimizer_steps as a cap if not converged.
-    # Let's use the actual steps, and if -1, plot it as a very high bar or special marker.
-    # For a bar chart, a common approach is to cap it or show it differently.
-    # We will cap at ase_max_optimizer_steps + a bit if -1
     penalty_steps = ase_max_optimizer_steps + 100 
     steps_plot_values = np.where(steps_tensor == -1, penalty_steps, steps_tensor)
 
     if len(steps_plot_values) == num_structures_plot:
         steps_data_fig1[:, method_idx] = steps_plot_values
-    else:
-        print(f"Warning: Mismatch in number of structures for steps in {method_name}. Expected {num_structures_plot}, got {len(steps_plot_values)}")
-        steps_data_fig1[:, method_idx] = np.nan
+    elif len(steps_plot_values) > num_structures_plot:
+        print(f"Warning: More step values ({len(steps_plot_values)}) than structure names ({num_structures_plot}) for {method_name}. Truncating.")
+        steps_data_fig1[:, method_idx] = steps_plot_values[:num_structures_plot]
+    elif len(steps_plot_values) < num_structures_plot:
+        print(f"Warning: Fewer step values ({len(steps_plot_values)}) than structure names ({num_structures_plot}) for {method_name}. Padding with NaN.")
+        steps_data_fig1[:len(steps_plot_values), method_idx] = steps_plot_values
+        # The rest will remain NaN due to initialization
 
-
-fig1, ax1 = plt.subplots(figsize=(15, 8))
-x_fig1 = np.arange(num_structures_plot) # x locations for the groups
-width_fig1 = 0.8 / num_methods_fig1 # width of the bars
+fig1, ax1 = plt.subplots(figsize=(17, 8)) # Wider for 6 structures + legend
+x_fig1 = np.arange(num_structures_plot) 
+width_fig1 = 0.8 / num_methods_fig1 
 
 rects_all_fig1 = []
 for i in range(num_methods_fig1):
-    # Offset each bar in the group
     rects = ax1.bar(x_fig1 - 0.4 + (i + 0.5) * width_fig1, steps_data_fig1[:, i], width_fig1, label=plot_methods_fig1[i])
     rects_all_fig1.append(rects)
-    # Add text for -1 (non-converged) if we plot them as penalty
     for bar_idx, bar_val in enumerate(steps_data_fig1[:, i]):
-        original_step_val = results_all[plot_methods_fig1[i]]["steps"].cpu().numpy()[bar_idx]
-        if original_step_val == -1:
-             ax1.text(rects[bar_idx].get_x() + rects[bar_idx].get_width() / 2., 
-                      rects[bar_idx].get_height() - 10, # Position slightly below top of penalty bar
-                      'NC', ha='center', va='top', color='white', fontsize=7, weight='bold')
-
+        if bar_idx < len(results_all[plot_methods_fig1[i]]["steps"]): # Check bounds
+            original_step_val = results_all[plot_methods_fig1[i]]["steps"].cpu().numpy()[bar_idx]
+            if original_step_val == -1 and not np.isnan(bar_val): # Check if it was a penalty bar
+                 ax1.text(rects[bar_idx].get_x() + rects[bar_idx].get_width() / 2., 
+                          rects[bar_idx].get_height() - 10, 
+                          'NC', ha='center', va='top', color='white', fontsize=7, weight='bold')
 
 ax1.set_ylabel('Convergence Steps (NC = Not Converged, shown at penalty)')
 ax1.set_xlabel('Structure')
 ax1.set_title('Convergence Steps per Structure and Method')
 ax1.set_xticks(x_fig1)
 ax1.set_xticklabels(structure_names, rotation=45, ha="right")
-ax1.legend(title="Optimization Method", bbox_to_anchor=(1.05, 1), loc='upper left')
+ax1.legend(title="Optimization Method", bbox_to_anchor=(1.02, 1), loc='upper left') # Adjusted legend position
 ax1.grid(True, axis='y', linestyle='--', alpha=0.7)
-plt.tight_layout(rect=[0, 0, 0.85, 1]) # Adjust rect to make space for legend
+plt.tight_layout(rect=[0, 0, 0.83, 1]) # Fine-tune rect for legend
 
 
 # --- Plot 2: Average Final Energy Difference from Baselines ---
@@ -556,58 +552,101 @@ baseline_ase_frechet = "ASE FIRE (Native Frechet Filter, CellOpt)"
 avg_energy_diffs_fig2 = []
 plot_names_fig2 = []
 
-# Ensure baselines exist and have data
 baseline_pos_only_data = results_all.get(baseline_ase_pos_only)
 baseline_frechet_data = results_all.get(baseline_ase_frechet)
 
 for name, result_data in results_all.items():
-    if result_data["final_state"] is None:
-        print(f"Plot2: Skipping energy diff for {name} as final_state is None.")
+    if result_data["final_state"] is None or result_data["final_state"].energy is None:
+        print(f"Plot2: Skipping energy diff for {name} as final_state or energy is None.")
+        if name not in plot_names_fig2: plot_names_fig2.append(name) # Keep name for consistent bar count
+        avg_energy_diffs_fig2.append(np.nan) # Add NaN if data missing
         continue
 
-    plot_names_fig2.append(name)
+    # Ensure name is added if not already by a skip
+    if name not in plot_names_fig2: plot_names_fig2.append(name)
+        
     current_energies = result_data["final_state"].energy.cpu().numpy()
     
     chosen_baseline_energies = None
     is_baseline_self = False
-    if "torch-sim" in name:
+    processed_current_name = False
+
+    if name == baseline_ase_pos_only or name == baseline_ase_frechet:
+        avg_energy_diffs_fig2.append(0.0) 
+        is_baseline_self = True
+        processed_current_name = True
+    elif "torch-sim" in name:
         if "PosOnly" in name:
-            if baseline_pos_only_data and baseline_pos_only_data["final_state"] is not None:
+            if baseline_pos_only_data and baseline_pos_only_data["final_state"] is not None and baseline_pos_only_data["final_state"].energy is not None:
                 chosen_baseline_energies = baseline_pos_only_data["final_state"].energy.cpu().numpy()
         elif "Frechet Cell" in name:
-            if baseline_frechet_data and baseline_frechet_data["final_state"] is not None:
+            if baseline_frechet_data and baseline_frechet_data["final_state"] is not None and baseline_frechet_data["final_state"].energy is not None:
                 chosen_baseline_energies = baseline_frechet_data["final_state"].energy.cpu().numpy()
-    elif name == baseline_ase_pos_only or name == baseline_ase_frechet:
-        avg_energy_diffs_fig2.append(0.0) # Difference to self is 0
-        is_baseline_self = True # Flag to handle text for baseline bars
-        # continue # Continue was here, but we need to plot the baseline bar itself
     
-    if not is_baseline_self: # Only calculate diff if not a baseline comparing to itself
+    if not is_baseline_self and not processed_current_name:
         if chosen_baseline_energies is not None:
             if current_energies.shape == chosen_baseline_energies.shape:
                 energy_diff = np.mean(current_energies - chosen_baseline_energies)
                 avg_energy_diffs_fig2.append(energy_diff)
             else:
                 avg_energy_diffs_fig2.append(np.nan)
-                print(f"Shape mismatch for energy comparison: {name} vs its baseline")
+                print(f"Plot2: Shape mismatch for energy comparison: {name} vs its baseline. "
+                      f"{current_energies.shape} vs {chosen_baseline_energies.shape}")
         else:
-            # If no appropriate baseline, or baseline data is missing
             print(f"Plot2: No appropriate baseline for {name} or baseline data missing. Setting energy diff to NaN.")
             avg_energy_diffs_fig2.append(np.nan)
+    elif not processed_current_name and name not in [n for n,v in zip(plot_names_fig2, avg_energy_diffs_fig2) if not np.isnan(v)] : # Handle cases not covered
+        print(f"Plot2: Fallback for {name}, setting energy diff to NaN.")
+        avg_energy_diffs_fig2.append(np.nan)
+
+
+# Ensure plot_names_fig2 and avg_energy_diffs_fig2 have the same length
+# This can happen if a name was added to plot_names_fig2 but its energy_diff calculation failed or was skipped.
+# A more robust way is to build them in parallel.
+final_plot_names_fig2 = []
+final_avg_energy_diffs_fig2 = []
+all_method_names_sorted = sorted(list(results_all.keys())) # Use a fixed order
+
+for name in all_method_names_sorted:
+    result_data = results_all[name]
+    final_plot_names_fig2.append(name)
+    if result_data["final_state"] is None or result_data["final_state"].energy is None:
+        final_avg_energy_diffs_fig2.append(np.nan)
+        continue
+    
+    current_energies = result_data["final_state"].energy.cpu().numpy()
+    energy_to_append = np.nan # Default to NaN
+
+    if name == baseline_ase_pos_only or name == baseline_ase_frechet:
+        energy_to_append = 0.0
+    elif "torch-sim" in name:
+        baseline_to_use_energies = None
+        if "PosOnly" in name:
+            if baseline_pos_only_data and baseline_pos_only_data["final_state"] is not None and baseline_pos_only_data["final_state"].energy is not None:
+                baseline_to_use_energies = baseline_pos_only_data["final_state"].energy.cpu().numpy()
+        elif "Frechet Cell" in name:
+            if baseline_frechet_data and baseline_frechet_data["final_state"] is not None and baseline_frechet_data["final_state"].energy is not None:
+                baseline_to_use_energies = baseline_frechet_data["final_state"].energy.cpu().numpy()
+        
+        if baseline_to_use_energies is not None:
+            if current_energies.shape == baseline_to_use_energies.shape:
+                energy_to_append = np.mean(current_energies - baseline_to_use_energies)
+            else:
+                print(f"Plot2: Shape mismatch for {name} ({current_energies.shape}) vs baseline ({baseline_to_use_energies.shape}).")
+    final_avg_energy_diffs_fig2.append(energy_to_append)
+
 
 fig2, ax2 = plt.subplots(figsize=(12, 7))
-bars_fig2 = ax2.bar(plot_names_fig2, avg_energy_diffs_fig2, color='lightcoral') # Store the bars
+bars_fig2 = ax2.bar(final_plot_names_fig2, final_avg_energy_diffs_fig2, color='lightcoral')
 ax2.set_ylabel('Avg. Final Energy Diff. from Corresponding ASE Baseline (eV)')
 ax2.set_xlabel('Optimization Method')
 ax2.set_title('Average Final Energy Difference from ASE Baselines')
 ax2.axhline(0, color='black', linewidth=0.8, linestyle='--')
 
-# Add text labels on top of bars for Figure 2
 for bar in bars_fig2:
     yval = bar.get_height()
-    if not np.isnan(yval): # Only add text if not NaN
-        # Adjust text position based on whether the bar is positive or negative
-        text_y_offset = 0.001 if yval >= 0 else -0.005 # Small offset for visibility
+    if not np.isnan(yval): 
+        text_y_offset = 0.001 if yval >= 0 else -0.005 
         va_align = 'bottom' if yval >=0 else 'top'
         ax2.text(bar.get_x() + bar.get_width()/2.0, yval + text_y_offset, 
                  f"{yval:.3f}", ha='center', va=va_align, fontsize=8, color='black')
@@ -616,66 +655,72 @@ plt.xticks(rotation=45, ha="right")
 plt.tight_layout()
 
 
-# --- Plot 3: Average Mean Displacement from ASE Counterparts ---
-disp_plot_data_fig3 = {} 
-comparison_pairs_plot3 = [
+# --- Plot 3: Mean Displacement from ASE Counterparts (Multi-bar per structure) ---
+comparison_pairs_plot3_defs = [ # (ts_method_name, ase_method_name, short_label_for_legend)
     ("torch-sim ASE-FIRE (PosOnly)", baseline_ase_pos_only, "TS ASE PosOnly vs ASE Native"),
     ("torch-sim VV-FIRE (PosOnly)", baseline_ase_pos_only, "TS VV PosOnly vs ASE Native"),
     ("torch-sim ASE-FIRE (Frechet Cell)", baseline_ase_frechet, "TS ASE Frechet vs ASE Frechet"),
     ("torch-sim VV-FIRE (Frechet Cell)", baseline_ase_frechet, "TS VV Frechet vs ASE Frechet"),
 ]
+num_comparison_pairs_plot3 = len(comparison_pairs_plot3_defs)
+# rows: structures, cols: comparison_pair
+disp_data_fig3 = np.full((num_structures_plot, num_comparison_pairs_plot3), np.nan) 
+legend_labels_fig3 = []
 
-for ts_method_name, ase_method_name, plot_label in comparison_pairs_plot3:
+for pair_idx, (ts_method_name, ase_method_name, plot_label) in enumerate(comparison_pairs_plot3_defs):
+    legend_labels_fig3.append(plot_label)
     if ts_method_name in results_all and ase_method_name in results_all:
         state1_data = results_all[ts_method_name]
         state2_data = results_all[ase_method_name]
 
         if state1_data["final_state"] is None or state2_data["final_state"] is None:
             print(f"Plot3: Skipping displacement for {plot_label} due to missing state data.")
-            disp_plot_data_fig3[plot_label] = np.nan
+            # Data remains NaN
             continue
         
         state1_list = state1_data["final_state"].split()
         state2_list = state2_data["final_state"].split()
         
-        if len(state1_list) != len(state2_list):
-            print(f"Plot3: Structure count mismatch for {plot_label}.")
-            disp_plot_data_fig3[plot_label] = np.nan
+        if len(state1_list) != len(state2_list) or len(state1_list) != num_structures_plot :
+            print(f"Plot3: Structure count mismatch for {plot_label}. Expected {num_structures_plot}, got S1:{len(state1_list)}, S2:{len(state2_list)}")
+            # Data remains NaN
             continue
 
-        mean_displacements_current_pair = []
-        for s1, s2 in zip(state1_list, state2_list, strict=True):
+        mean_displacements_for_this_pair = []
+        for s_idx, (s1, s2) in enumerate(zip(state1_list, state2_list, strict=True)):
             if s1.n_atoms == 0 or s2.n_atoms == 0 or s1.n_atoms != s2.n_atoms:
-                mean_displacements_current_pair.append(np.nan)
+                mean_displacements_for_this_pair.append(np.nan)
                 continue
             pos1_centered = s1.positions - s1.positions.mean(dim=0, keepdim=True)
             pos2_centered = s2.positions - s2.positions.mean(dim=0, keepdim=True)
             displacement = torch.norm(pos1_centered - pos2_centered, dim=1)
             mean_disp = torch.mean(displacement).item()
-            mean_displacements_current_pair.append(mean_disp)
+            mean_displacements_for_this_pair.append(mean_disp)
         
-        if mean_displacements_current_pair:
-            avg_disp = np.nanmean(mean_displacements_current_pair)
-            disp_plot_data_fig3[plot_label] = avg_disp
-        else:
-            disp_plot_data_fig3[plot_label] = np.nan
+        if len(mean_displacements_for_this_pair) == num_structures_plot:
+            disp_data_fig3[:, pair_idx] = np.array(mean_displacements_for_this_pair)
+        else: # Should not happen if previous checks pass
+            print(f"Plot3: Inner loop displacement calculation mismatch for {plot_label}")
+
     else:
-        print(f"Plot3: Missing data for {ts_method_name} or {ase_method_name}.")
-        disp_plot_data_fig3[plot_label] = np.nan
+        print(f"Plot3: Missing data for methods in pair: {plot_label}.")
+        # Data remains NaN
 
+fig3, ax3 = plt.subplots(figsize=(17, 8)) # Wider for 6 structures + legend
+x_fig3 = np.arange(num_structures_plot) 
+width_fig3 = 0.8 / num_comparison_pairs_plot3
 
-if disp_plot_data_fig3:
-    disp_methods_fig3 = list(disp_plot_data_fig3.keys())
-    disp_values_fig3 = list(disp_plot_data_fig3.values())
+for i in range(num_comparison_pairs_plot3):
+    ax3.bar(x_fig3 - 0.4 + (i + 0.5) * width_fig3, disp_data_fig3[:, i], width_fig3, label=legend_labels_fig3[i])
 
-    fig3, ax3 = plt.subplots(figsize=(12, 8))
-    ax3.bar(disp_methods_fig3, disp_values_fig3, color='mediumseagreen')
-    ax3.set_ylabel('Avg. Mean Atomic Displacement (Å) to ASE Counterpart')
-    ax3.set_xlabel('Comparison Pair')
-    ax3.set_title('Mean Displacement of Torch-Sim Methods to ASE Counterparts')
-    plt.xticks(rotation=45, ha="right")
-    plt.tight_layout()
-else:
-    print("No displacement data to plot for Figure 3.")
+ax3.set_ylabel('Mean Atomic Displacement (Å) to ASE Counterpart')
+ax3.set_xlabel('Structure')
+ax3.set_title('Mean Displacement of Torch-Sim Methods to ASE Counterparts (per Structure)')
+ax3.set_xticks(x_fig3)
+ax3.set_xticklabels(structure_names, rotation=45, ha="right")
+ax3.legend(title="Comparison Pair", bbox_to_anchor=(1.02, 1), loc='upper left') # Adjusted legend
+ax3.grid(True, axis='y', linestyle='--', alpha=0.7)
+plt.tight_layout(rect=[0, 0, 0.83, 1]) # Fine-tune rect for legend
+
 
 plt.show()
