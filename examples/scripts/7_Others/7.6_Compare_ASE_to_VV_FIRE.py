@@ -17,6 +17,7 @@ import torch
 from ase.build import bulk
 from ase.optimize import FIRE as ASEFIRE
 from ase.filters import FrechetCellFilter
+from ase.cell import Cell
 from mace.calculators.foundations_models import mace_mp
 from mace.calculators.foundations_models import mace_mp as mace_mp_calculator_for_ase
 import matplotlib.pyplot as plt
@@ -138,6 +139,13 @@ def run_optimization(
         )
         start_time = time.perf_counter()
 
+        print("Initial cell parameters (Torch-Sim):")
+        for k_idx in range(initial_state.n_batches):
+            cell_tensor_k = initial_state.cell[k_idx].cpu().numpy()
+            ase_cell_k = Cell(cell_tensor_k)
+            params_str = ", ".join([f"{p:.2f}" for p in ase_cell_k.cellpar()])
+            print(f"  Structure {k_idx+1}: Volume={ase_cell_k.volume:.2f} Å³, Params=[{params_str}]")
+
         if ts_use_frechet:
             # Uses frechet_cell_fire for combined cell and position optimization
             init_fn_opt, update_fn_opt = frechet_cell_fire(
@@ -217,6 +225,17 @@ def run_optimization(
         
         final_states_list = batcher.restore_original_order(all_converged_states)
         final_state_concatenated = ts.concatenate_states(final_states_list)
+
+        if final_state_concatenated is not None and hasattr(final_state_concatenated, 'cell'):
+            print("Final cell parameters (Torch-Sim):")
+            for k_idx in range(final_state_concatenated.n_batches):
+                cell_tensor_k = final_state_concatenated.cell[k_idx].cpu().numpy()
+                ase_cell_k = Cell(cell_tensor_k)
+                params_str = ", ".join([f"{p:.2f}" for p in ase_cell_k.cellpar()])
+                print(f"  Structure {k_idx+1}: Volume={ase_cell_k.volume:.2f} Å³, Params=[{params_str}]")
+        else:
+            print("Final cell parameters (Torch-Sim): Not available (final_state_concatenated is None or has no cell).")
+
         end_time = time.perf_counter()
         print(
             f"Finished Torch-Sim ({ts_md_flavor}, frechet={ts_use_frechet}) in "
@@ -240,6 +259,10 @@ def run_optimization(
             print(f"Optimizing structure {i+1}/{num_structures} with ASE...")
             ase_atoms_orig = ts.io.state_to_atoms(single_sim_state)[0]
 
+            initial_cell_ase = ase_atoms_orig.get_cell()
+            initial_params_str = ", ".join([f"{p:.2f}" for p in initial_cell_ase.cellpar()])
+            print(f"  Initial cell (ASE Structure {i+1}): Volume={initial_cell_ase.volume:.2f} Å³, Params=[{initial_params_str}]")
+            
             ase_calc_instance = mace_mp_calculator_for_ase(
                 model=MaceUrls.mace_mpa_medium,
                 device=device,
@@ -269,7 +292,12 @@ def run_optimization(
                 print(f"ASE optimization failed for structure {i+1}: {e}")
                 convergence_steps_list.append(-1)
 
-            final_ase_atoms_list.append(optim_target_atoms.atoms if ase_use_frechet_filter else ase_atoms_orig)
+            final_ats_for_print = optim_target_atoms.atoms if ase_use_frechet_filter else ase_atoms_orig
+            final_cell_ase = final_ats_for_print.get_cell()
+            final_params_str = ", ".join([f"{p:.2f}" for p in final_cell_ase.cellpar()])
+            print(f"  Final cell (ASE Structure {i+1}): Volume={final_cell_ase.volume:.2f} Å³, Params=[{final_params_str}]")
+            
+            final_ase_atoms_list.append(final_ats_for_print)
 
         # Convert list of final ASE atoms objects back to a base SimState first
         # to easily get positions, cell, etc.
@@ -388,7 +416,7 @@ configs_to_run = [
         "type": "torch_sim", "ts_md_flavor": "ase_fire", "ts_use_frechet": True,
     },
     {
-        "name": "ASE FIRE (Native, CellOpt)", # Will optimize cell if stress is available
+        "name": "ASE FIRE (Native, PosOnly)", # Corrected name: Only optimizes positions without a cell filter
         "type": "ase", "ase_use_frechet_filter": False,
     },
     {
@@ -439,10 +467,10 @@ for name, result_data in results_all.items():
 
 # Mean Displacement Comparisons
 comparison_pairs = [
-    ("torch-sim ASE-FIRE (PosOnly)", "ASE FIRE (Native, CellOpt)"), # Note: one is pos-only, other cell-opt
+    ("torch-sim ASE-FIRE (PosOnly)", "ASE FIRE (Native, PosOnly)"), 
     ("torch-sim ASE-FIRE (Frechet Cell)", "ASE FIRE (Native Frechet Filter, CellOpt)"),
     ("torch-sim VV-FIRE (Frechet Cell)", "ASE FIRE (Native Frechet Filter, CellOpt)"),
-    ("torch-sim VV-FIRE (PosOnly)", "torch-sim ASE-FIRE (PosOnly)"), # Original comparison
+    ("torch-sim VV-FIRE (PosOnly)", "ASE FIRE (Native, PosOnly)"), 
 ]
 
 for name1, name2 in comparison_pairs:
@@ -547,7 +575,7 @@ plt.tight_layout(rect=[0, 0, 0.83, 1]) # Fine-tune rect for legend
 
 
 # --- Plot 2: Average Final Energy Difference from Baselines ---
-baseline_ase_pos_only = "ASE FIRE (Native, CellOpt)"
+baseline_ase_pos_only = "ASE FIRE (Native, PosOnly)"
 baseline_ase_frechet = "ASE FIRE (Native Frechet Filter, CellOpt)"
 avg_energy_diffs_fig2 = []
 plot_names_fig2 = []
