@@ -275,7 +275,7 @@ class CorrelationCalculator:
             self.correlations[name] = acf
 
         # Cross-correlations
-        names = list(self.buffers.keys())
+        names = list(self.buffers)
         for i, name1 in enumerate(names):
             for name2 in names[i + 1 :]:
                 data1 = self.buffers[name1].get_array()

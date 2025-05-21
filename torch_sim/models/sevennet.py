@@ -125,7 +125,7 @@ class SevenNetModel(torch.nn.Module, ModelInterface):
         self.modal = None
         modal_map = self.model.modal_map
         if modal_map:
-            modal_ava = list(modal_map.keys())
+            modal_ava = list(modal_map)
             if not modal:
                 raise ValueError(f"modal argument missing (avail: {modal_ava})")
             if modal not in modal_ava:

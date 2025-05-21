@@ -114,7 +114,7 @@ Note that the energy here refers to the potential energy of the system.
 
 # %%
 model_outputs = model(state)
-print(f"Model outputs: {', '.join(list(model_outputs.keys()))}")
+print(f"Model outputs: {', '.join(list(model_outputs))}")
 
 print(f"Energy is a batchwise property with shape: {model_outputs['energy'].shape}")
 print(f"Forces are an atomwise property with shape: {model_outputs['forces'].shape}")

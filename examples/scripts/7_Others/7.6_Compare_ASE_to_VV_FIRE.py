@@ -12,8 +12,8 @@ import os
 import time
 from typing import Literal
 
-import matplotlib.pyplot as plt
 import numpy as np
+import plotly.graph_objects as go
 import torch
 from ase.build import bulk
 from ase.cell import Cell
@@ -598,13 +598,14 @@ structure_names = [
 ]  # Updated for 6 structures
 if len(structure_names) != len(atoms_list):
     print(
-        f"Warning: Mismatch between custom structure_names ({len(structure_names)}) and atoms_list ({len(atoms_list)}). Using custom names."
+        f"Warning: Mismatch between custom structure_names ({len(structure_names)}) and "
+        f"atoms_list ({len(atoms_list)}). Using custom names."
     )
 num_structures_plot = len(structure_names)
 
 
 # --- Plot 1: Convergence Steps (Multi-bar per structure) ---
-plot_methods_fig1 = list(all_results.keys())
+plot_methods_fig1 = list(all_results)
 num_methods_fig1 = len(plot_methods_fig1)
 # Initialize with NaNs, so if a method fails completely, its bars are missing or clearly marked
 steps_data_fig1 = np.full((num_structures_plot, num_methods_fig1), np.nan)
@@ -634,48 +635,42 @@ for method_idx, method_name in enumerate(plot_methods_fig1):
         steps_data_fig1[: len(steps_plot_values), method_idx] = steps_plot_values
         # The rest will remain NaN due to initialization
 
-fig1, ax1 = plt.subplots(figsize=(17, 8))  # Wider for 6 structures + legend
-x_fig1 = np.arange(num_structures_plot)
-width_fig1 = 0.8 / num_methods_fig1
+fig1_plotly = go.Figure()
 
-rects_all_fig1 = []
 for i in range(num_methods_fig1):
-    rects = ax1.bar(
-        x_fig1 - 0.4 + (i + 0.5) * width_fig1,
-        steps_data_fig1[:, i],
-        width_fig1,
-        label=plot_methods_fig1[i],
+    fig1_plotly.add_bar(
+        name=plot_methods_fig1[i],
+        x=structure_names,  # x-axis is structure names
+        y=steps_data_fig1[:, i],
+        text=[
+            "NC"
+            if all_results[plot_methods_fig1[i]]["steps"].cpu().numpy()[bar_idx] == -1
+            and not np.isnan(steps_data_fig1[bar_idx, i])
+            else ""
+            for bar_idx in range(num_structures_plot)
+        ],
+        textposition="inside",
+        insidetextanchor="middle",
+        textfont=dict(color="white", size=10, family="Arial, sans-serif"),
     )
-    rects_all_fig1.append(rects)
-    for bar_idx, bar_val in enumerate(steps_data_fig1[:, i]):
-        if bar_idx < len(all_results[plot_methods_fig1[i]]["steps"]):  # Check bounds
-            original_step_val = (
-                all_results[plot_methods_fig1[i]]["steps"].cpu().numpy()[bar_idx]
-            )
-            if original_step_val == -1 and not np.isnan(
-                bar_val
-            ):  # Check if it was a penalty bar
-                ax1.text(
-                    rects[bar_idx].get_x() + rects[bar_idx].get_width() / 2.0,
-                    rects[bar_idx].get_height() - 10,
-                    "NC",
-                    ha="center",
-                    va="top",
-                    color="white",
-                    fontsize=7,
-                    weight="bold",
-                )
 
-ax1.set_ylabel("Convergence Steps (NC = Not Converged, shown at penalty)")
-ax1.set_xlabel("Structure")
-ax1.set_title("Convergence Steps per Structure and Method")
-ax1.set_xticks(x_fig1)
-ax1.set_xticklabels(structure_names, rotation=45, ha="right")
-ax1.legend(
-    title="Optimization Method", bbox_to_anchor=(1.02, 1), loc="upper left"
-)  # Adjusted legend position
-ax1.grid(True, axis="y", linestyle="--", alpha=0.7)
-plt.tight_layout(rect=[0, 0, 0.83, 1])  # Fine-tune rect for legend
+fig1_plotly.update_layout(
+    barmode="group",
+    title_text="Convergence Steps per Structure and Method",
+    xaxis_title="Structure",
+    yaxis_title="Convergence Steps (NC = Not Converged, shown at penalty)",
+    legend_title="Optimization Method",
+    xaxis_tickangle=-45,
+    yaxis_gridcolor="lightgrey",
+    plot_bgcolor="white",
+    height=600,
+    width=max(
+        1000, 150 * num_structures_plot
+    ),  # Adjust width based on number of structures
+    margin=dict(l=50, r=50, b=100, t=50, pad=4),
+    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+)
+fig1_plotly.update_xaxes(categoryorder="array", categoryarray=structure_names)
 
 
 # --- Plot 2: Average Final Energy Difference from Baselines ---
@@ -705,7 +700,7 @@ for name, result_data in all_results.items():
     is_baseline_self = False
     processed_current_name = False
 
-    if name == baseline_ase_pos_only or name == baseline_ase_frechet:
+    if name in (baseline_ase_pos_only, baseline_ase_frechet):
         avg_energy_diffs_fig2.append(0.0)
         is_baseline_self = True
         processed_current_name = True
@@ -719,15 +714,14 @@ for name, result_data in all_results.items():
                 chosen_baseline_energies = (
                     baseline_pos_only_data["final_state"].energy.cpu().numpy()
                 )
-        elif "Frechet Cell" in name:
-            if (
-                baseline_frechet_data
-                and baseline_frechet_data["final_state"] is not None
-                and baseline_frechet_data["final_state"].energy is not None
-            ):
-                chosen_baseline_energies = (
-                    baseline_frechet_data["final_state"].energy.cpu().numpy()
-                )
+        elif "Frechet Cell" in name and (
+            baseline_frechet_data
+            and baseline_frechet_data["final_state"] is not None
+            and baseline_frechet_data["final_state"].energy is not None
+        ):
+            chosen_baseline_energies = (
+                baseline_frechet_data["final_state"].energy.cpu().numpy()
+            )
 
     if not is_baseline_self and not processed_current_name:
         if chosen_baseline_energies is not None:
@@ -737,12 +731,13 @@ for name, result_data in all_results.items():
             else:
                 avg_energy_diffs_fig2.append(np.nan)
                 print(
-                    f"Plot2: Shape mismatch for energy comparison: {name} vs its baseline. "
+                    f"Plot2: Shape mismatch for energy comparison: {name} vs baseline. "
                     f"{current_energies.shape} vs {chosen_baseline_energies.shape}"
                 )
         else:
             print(
-                f"Plot2: No appropriate baseline for {name} or baseline data missing. Setting energy diff to NaN."
+                f"Plot2: No appropriate baseline for {name} or baseline data missing. "
+                "Setting energy diff to NaN."
             )
             avg_energy_diffs_fig2.append(np.nan)
     elif not processed_current_name and name not in [
@@ -759,7 +754,7 @@ for name, result_data in all_results.items():
 # A more robust way is to build them in parallel.
 final_plot_names_fig2 = []
 final_avg_energy_diffs_fig2 = []
-all_method_names_sorted = sorted(list(all_results.keys()))  # Use a fixed order
+all_method_names_sorted = sorted(all_results)  # Use a fixed order
 
 for name in all_method_names_sorted:
     result_data = all_results[name]
@@ -771,7 +766,7 @@ for name in all_method_names_sorted:
     current_energies = result_data["final_state"].energy.cpu().numpy()
     energy_to_append = np.nan  # Default to NaN
 
-    if name == baseline_ase_pos_only or name == baseline_ase_frechet:
+    if name in (baseline_ase_pos_only, baseline_ase_frechet):
         energy_to_append = 0.0
     elif "torch-sim" in name:
         baseline_to_use_energies = None
@@ -784,52 +779,53 @@ for name in all_method_names_sorted:
                 baseline_to_use_energies = (
                     baseline_pos_only_data["final_state"].energy.cpu().numpy()
                 )
-        elif "Frechet Cell" in name:
-            if (
-                baseline_frechet_data
-                and baseline_frechet_data["final_state"] is not None
-                and baseline_frechet_data["final_state"].energy is not None
-            ):
-                baseline_to_use_energies = (
-                    baseline_frechet_data["final_state"].energy.cpu().numpy()
-                )
+        elif "Frechet Cell" in name and (
+            baseline_frechet_data
+            and baseline_frechet_data["final_state"] is not None
+            and baseline_frechet_data["final_state"].energy is not None
+        ):
+            baseline_to_use_energies = (
+                baseline_frechet_data["final_state"].energy.cpu().numpy()
+            )
 
         if baseline_to_use_energies is not None:
             if current_energies.shape == baseline_to_use_energies.shape:
                 energy_to_append = np.mean(current_energies - baseline_to_use_energies)
             else:
                 print(
-                    f"Plot2: Shape mismatch for {name} ({current_energies.shape}) vs baseline ({baseline_to_use_energies.shape})."
+                    f"Plot2: Shape mismatch for {name} ({current_energies.shape}) "
+                    f"vs baseline ({baseline_to_use_energies.shape})."
                 )
     final_avg_energy_diffs_fig2.append(energy_to_append)
 
 
-fig2, ax2 = plt.subplots(figsize=(12, 7))
-bars_fig2 = ax2.bar(
-    final_plot_names_fig2, final_avg_energy_diffs_fig2, color="lightcoral"
+fig2_plotly = go.Figure()
+fig2_plotly.add_bar(
+    x=final_plot_names_fig2,
+    y=final_avg_energy_diffs_fig2,
+    marker_color="lightcoral",
+    text=[
+        f"{yval:.3f}" if not np.isnan(yval) else ""
+        for yval in final_avg_energy_diffs_fig2
+    ],
+    textposition="auto",  # Let Plotly decide best position, or use 'outside'/'inside'
+    textfont=dict(size=10),
 )
-ax2.set_ylabel("Avg. Final Energy Diff. from Corresponding ASE Baseline (eV)")
-ax2.set_xlabel("Optimization Method")
-ax2.set_title("Average Final Energy Difference from ASE Baselines")
-ax2.axhline(0, color="black", linewidth=0.8, linestyle="--")
 
-for bar in bars_fig2:
-    yval = bar.get_height()
-    if not np.isnan(yval):
-        text_y_offset = 0.001 if yval >= 0 else -0.005
-        va_align = "bottom" if yval >= 0 else "top"
-        ax2.text(
-            bar.get_x() + bar.get_width() / 2.0,
-            yval + text_y_offset,
-            f"{yval:.3f}",
-            ha="center",
-            va=va_align,
-            fontsize=8,
-            color="black",
-        )
-
-plt.xticks(rotation=45, ha="right")
-plt.tight_layout()
+line_dict = dict(color="black", width=1, dash="dash")
+x1 = len(final_plot_names_fig2) - 0.5
+fig2_plotly.update_layout(
+    title_text="Average Final Energy Difference from ASE Baselines",
+    xaxis_title="Optimization Method",
+    yaxis_title="Avg. Final Energy Diff. from Corresponding ASE Baseline (eV)",
+    xaxis_tickangle=-45,
+    yaxis_gridcolor="lightgrey",
+    plot_bgcolor="white",
+    shapes=[dict(type="line", y0=0, y1=0, x0=-0.5, x1=x1, line=line_dict)],
+    height=600,
+    width=max(800, 100 * len(final_plot_names_fig2)),
+    margin=dict(l=50, r=50, b=150, t=50, pad=4),  # Increased bottom margin for labels
+)
 
 
 # --- Plot 3: Mean Displacement from ASE Counterparts (Multi-bar per structure) ---
@@ -866,9 +862,8 @@ for pair_idx, (ts_method_name, ase_method_name, plot_label) in enumerate(
 
         if state1_data["final_state"] is None or state2_data["final_state"] is None:
             print(
-                f"Plot3: Skipping displacement for {plot_label} due to missing state data."
+                f"Plot3: Skipping displacement for {plot_label} due to missing state data"
             )
-            # Data remains NaN
             continue
 
         state1_list = state1_data["final_state"].split()
@@ -880,13 +875,13 @@ for pair_idx, (ts_method_name, ase_method_name, plot_label) in enumerate(
         ):
             print(
                 f"Plot3: Structure count mismatch for {plot_label}. "
-                f"Expected {num_structures_plot}, got S1:{len(state1_list)}, S2:{len(state2_list)}"
+                f"Expected {num_structures_plot}, got S1:{len(state1_list)}, "
+                f"S2:{len(state2_list)}"
             )
-            # Data remains NaN
             continue
 
         mean_displacements_for_this_pair = []
-        for s_idx, (s1, s2) in enumerate(zip(state1_list, state2_list, strict=True)):
+        for s1, s2 in zip(state1_list, state2_list, strict=True):
             if s1.n_atoms == 0 or s2.n_atoms == 0 or s1.n_atoms != s2.n_atoms:
                 mean_displacements_for_this_pair.append(np.nan)
                 continue
@@ -905,30 +900,31 @@ for pair_idx, (ts_method_name, ase_method_name, plot_label) in enumerate(
         print(f"Plot3: Missing data for methods in pair: {plot_label}.")
         # Data remains NaN
 
-fig3, ax3 = plt.subplots(figsize=(17, 8))  # Wider for 6 structures + legend
-x_fig3 = np.arange(num_structures_plot)
-width_fig3 = 0.8 / num_comparison_pairs_plot3
+fig3_plotly = go.Figure()
 
-for i in range(num_comparison_pairs_plot3):
-    ax3.bar(
-        x_fig3 - 0.4 + (i + 0.5) * width_fig3,
-        disp_data_fig3[:, i],
-        width_fig3,
-        label=legend_labels_fig3[i],
-    )
+for idx, name in enumerate(legend_labels_fig3):
+    # x-axis is structure names
+    fig3_plotly.add_bar(name=name, x=structure_names, y=disp_data_fig3[:, idx])
 
-ax3.set_ylabel("Mean Atomic Displacement (Å) to ASE Counterpart")
-ax3.set_xlabel("Structure")
-ax3.set_title(
-    "Mean Displacement of Torch-Sim Methods to ASE Counterparts (per Structure)"
+
+title = "Mean Displacement of Torch-Sim Methods to ASE Counterparts (per Structure)"
+fig3_plotly.update_layout(
+    barmode="group",
+    title=dict(text=title, x=0.5, y=1),
+    xaxis_title="Structure",
+    yaxis_title="Mean Atomic Displacement (Å) to ASE Counterpart",
+    legend_title="Comparison Pair",
+    xaxis_tickangle=-45,
+    yaxis_gridcolor="lightgrey",
+    plot_bgcolor="white",
+    height=600,
+    width=max(1000, 150 * num_structures_plot),  # Adjust width
+    margin=dict(l=50, r=50, b=100, t=50, pad=4),
+    legend=dict(orientation="h", yanchor="bottom", y=0.96, xanchor="right", x=1),
 )
-ax3.set_xticks(x_fig3)
-ax3.set_xticklabels(structure_names, rotation=45, ha="right")
-ax3.legend(
-    title="Comparison Pair", bbox_to_anchor=(1.02, 1), loc="upper left"
-)  # Adjusted legend
-ax3.grid(True, axis="y", linestyle="--", alpha=0.7)
-plt.tight_layout(rect=[0, 0, 0.83, 1])  # Fine-tune rect for legend
 
 
-plt.show()
+# Show Plotly figures
+fig1_plotly.show()
+fig2_plotly.show()
+fig3_plotly.show()

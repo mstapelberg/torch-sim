@@ -44,7 +44,7 @@ def test_graphpes_isolated(device: torch.device):
         compute_stress=False,
     )
     ts_output = ts_model(ts.io.atoms_to_state([water_atoms], device, torch.float32))
-    assert set(ts_output.keys()) == {"energy", "forces"}
+    assert set(ts_output) == {"energy", "forces"}
     assert ts_output["energy"].shape == (1,)
 
     assert gp_energy.item() == pytest.approx(ts_output["energy"].item(), abs=1e-5)
@@ -69,7 +69,7 @@ def test_graphpes_periodic(device: torch.device):
         compute_stress=True,
     )
     ts_output = ts_model(ts.io.atoms_to_state([bulk_atoms], device, torch.float32))
-    assert set(ts_output.keys()) == {"energy", "forces", "stress"}
+    assert set(ts_output) == {"energy", "forces", "stress"}
     assert ts_output["energy"].shape == (1,)
     assert ts_output["forces"].shape == (len(bulk_atoms), 3)
     assert ts_output["stress"].shape == (1, 3, 3)
@@ -101,7 +101,7 @@ def test_batching(device: torch.device):
     )
     ts_output = ts_model(ts.io.atoms_to_state(systems, device, torch.float32))
 
-    assert set(ts_output.keys()) == {"energy", "forces", "stress"}
+    assert set(ts_output) == {"energy", "forces", "stress"}
     assert ts_output["energy"].shape == (2,)
     assert ts_output["forces"].shape == (sum(len(s) for s in systems), 3)
     assert ts_output["stress"].shape == (2, 3, 3)
