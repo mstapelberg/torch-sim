@@ -12,19 +12,19 @@ import os
 import time
 from typing import Literal
 
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from ase.build import bulk
-from ase.optimize import FIRE as ASEFIRE
-from ase.filters import FrechetCellFilter
 from ase.cell import Cell
+from ase.filters import FrechetCellFilter
+from ase.optimize import FIRE as ASEFIRE
 from mace.calculators.foundations_models import mace_mp
 from mace.calculators.foundations_models import mace_mp as mace_mp_calculator_for_ase
-import matplotlib.pyplot as plt
 
 import torch_sim as ts
 from torch_sim.models.mace import MaceModel, MaceUrls
-from torch_sim.optimizers import fire, frechet_cell_fire, GDState
+from torch_sim.optimizers import GDState, fire, frechet_cell_fire
 from torch_sim.state import SimState
 
 
@@ -44,7 +44,8 @@ loaded_model = mace_mp(
 # Number of steps to run
 max_iterations = 10 if os.getenv("CI") else 500
 supercell_scale = (1, 1, 1) if os.getenv("CI") else (3, 2, 2)
-ase_max_optimizer_steps = max_iterations * 10 # Max steps for each individual ASE optimization run
+# Max steps for each individual ASE optimization run
+ase_max_optimizer_steps = max_iterations * 10
 
 # Set random seed for reproducibility
 rng = np.random.default_rng(seed=0)
@@ -119,279 +120,314 @@ state = ts.io.atoms_to_state(atoms_list, device=device, dtype=dtype)
 initial_energies = model(state)["energy"]
 
 
-def run_optimization(
+def run_optimization_ts(
+    *,
     initial_state: SimState,
-    optimizer_type: Literal["torch_sim", "ase"],
-    # For torch_sim:
-    ts_md_flavor: Literal["vv_fire", "ase_fire"] | None = None,
-    ts_use_frechet: bool = False, # To decide between fire() and frechet_cell_fire()
-    # For ASE:
-    ase_use_frechet_filter: bool = False,
-    # Common:
-    force_tol: float = 0.05,
-) -> tuple[torch.Tensor, SimState]:
-    """Runs optimization and returns convergence steps and final state."""
-    if optimizer_type == "torch_sim":
-        assert ts_md_flavor is not None, "ts_md_flavor must be provided for torch_sim"
-        print(
-            f"\n--- Running Torch-Sim optimization: flavor={ts_md_flavor}, "
-            f"frechet_cell_opt={ts_use_frechet}, force_tol={force_tol} ---"
-        )
-        start_time = time.perf_counter()
+    ts_md_flavor: Literal["vv_fire", "ase_fire"],
+    ts_use_frechet: bool,
+    force_tol: float,
+    max_iterations_ts: int,
+) -> tuple[torch.Tensor, SimState | None]:
+    """Runs Torch-Sim optimization and returns convergence steps and final state."""
+    print(
+        f"\n--- Running Torch-Sim optimization: flavor={ts_md_flavor}, "
+        f"frechet_cell_opt={ts_use_frechet}, force_tol={force_tol} ---"
+    )
+    start_time = time.perf_counter()
 
-        print("Initial cell parameters (Torch-Sim):")
-        for k_idx in range(initial_state.n_batches):
-            cell_tensor_k = initial_state.cell[k_idx].cpu().numpy()
+    print("Initial cell parameters (Torch-Sim):")
+    for k_idx in range(initial_state.n_batches):
+        cell_tensor_k = initial_state.cell[k_idx].cpu().numpy()
+        ase_cell_k = Cell(cell_tensor_k)
+        params_str = ", ".join([f"{p:.2f}" for p in ase_cell_k.cellpar()])
+        print(
+            f"  Structure {k_idx + 1}: Volume={ase_cell_k.volume:.2f} Å³, Params=[{params_str}]"
+        )
+
+    if ts_use_frechet:
+        # Uses frechet_cell_fire for combined cell and position optimization
+        init_fn_opt, update_fn_opt = frechet_cell_fire(
+            model=model, md_flavor=ts_md_flavor
+        )
+    else:
+        # Uses fire for position-only optimization
+        init_fn_opt, update_fn_opt = fire(model=model, md_flavor=ts_md_flavor)
+
+    opt_state = init_fn_opt(initial_state.clone())
+
+    batcher = ts.InFlightAutoBatcher(
+        model=model,  # The MaceModel wrapper
+        memory_scales_with="n_atoms",
+        max_memory_scaler=1000,
+        max_iterations=max_iterations_ts,  # Use the passed max_iterations
+        return_indices=True,
+    )
+    batcher.load_states(opt_state)
+
+    total_structures = opt_state.n_batches
+    convergence_steps = torch.full(
+        (total_structures,), -1, dtype=torch.long, device=device
+    )
+    convergence_fn = ts.generate_force_convergence_fn(force_tol=force_tol)
+    converged_tensor_global = torch.zeros(
+        total_structures, dtype=torch.bool, device=device
+    )
+    global_step = 0
+    all_converged_states = []
+    convergence_tensor_for_batcher = None
+    last_active_state = opt_state
+
+    while True:
+        result = batcher.next_batch(last_active_state, convergence_tensor_for_batcher)
+        opt_state, converged_states_from_batcher, current_indices_list = result
+        all_converged_states.extend(converged_states_from_batcher)
+
+        if opt_state is None:
+            print("All structures converged or batcher reached max iterations.")
+            break
+
+        last_active_state = opt_state
+        current_indices = torch.tensor(
+            current_indices_list, dtype=torch.long, device=device
+        )
+
+        steps_this_round = 10
+        for _ in range(steps_this_round):
+            opt_state = update_fn_opt(opt_state)
+        global_step += steps_this_round
+
+        convergence_tensor_for_batcher = convergence_fn(opt_state, None)
+        newly_converged_mask_local = convergence_tensor_for_batcher & (
+            convergence_steps[current_indices] == -1
+        )
+        converged_indices_global = current_indices[newly_converged_mask_local]
+
+        if converged_indices_global.numel() > 0:
+            convergence_steps[converged_indices_global] = global_step
+            converged_tensor_global[converged_indices_global] = True
+            total_converged_frac = converged_tensor_global.sum().item() / total_structures
+            print(
+                f"{global_step=}: Converged indices {converged_indices_global.tolist()}, "
+                f"Total converged: {total_converged_frac:.2%}"
+            )
+
+        if global_step % 50 == 0:
+            total_converged_frac = converged_tensor_global.sum().item() / total_structures
+            active_structures = opt_state.n_batches if opt_state else 0
+            print(
+                f"{global_step=}: Active structures: {active_structures}, "
+                f"Total converged: {total_converged_frac:.2%}"
+            )
+
+    final_states_list = batcher.restore_original_order(all_converged_states)
+    final_state_concatenated = ts.concatenate_states(final_states_list)
+
+    if final_state_concatenated is not None and hasattr(final_state_concatenated, "cell"):
+        print("Final cell parameters (Torch-Sim):")
+        for k_idx in range(final_state_concatenated.n_batches):
+            cell_tensor_k = final_state_concatenated.cell[k_idx].cpu().numpy()
             ase_cell_k = Cell(cell_tensor_k)
             params_str = ", ".join([f"{p:.2f}" for p in ase_cell_k.cellpar()])
-            print(f"  Structure {k_idx+1}: Volume={ase_cell_k.volume:.2f} Å³, Params=[{params_str}]")
-
-        if ts_use_frechet:
-            # Uses frechet_cell_fire for combined cell and position optimization
-            init_fn_opt, update_fn_opt = frechet_cell_fire(
-                model=model, md_flavor=ts_md_flavor
+            print(
+                f"  Structure {k_idx + 1}: Volume={ase_cell_k.volume:.2f} Å³, Params=[{params_str}]"
             )
-        else:
-            # Uses fire for position-only optimization
-            init_fn_opt, update_fn_opt = fire(model=model, md_flavor=ts_md_flavor)
-
-        opt_state = init_fn_opt(initial_state.clone())
-
-        batcher = ts.InFlightAutoBatcher(
-            model=model, # The MaceModel wrapper
-            memory_scales_with="n_atoms",
-            max_memory_scaler=1000,
-            max_iterations=max_iterations,
-            return_indices=True,
-        )
-        batcher.load_states(opt_state)
-
-        total_structures = opt_state.n_batches
-        convergence_steps = torch.full(
-            (total_structures,), -1, dtype=torch.long, device=device
-        )
-        convergence_fn = ts.generate_force_convergence_fn(force_tol=force_tol)
-        converged_tensor_global = torch.zeros(
-            total_structures, dtype=torch.bool, device=device
-        )
-        global_step = 0
-        all_converged_states = []
-        convergence_tensor_for_batcher = None
-        last_active_state = opt_state
-
-        while True:
-            result = batcher.next_batch(
-                last_active_state, convergence_tensor_for_batcher
-            )
-            opt_state, converged_states_from_batcher, current_indices_list = result
-            all_converged_states.extend(converged_states_from_batcher)
-
-            if opt_state is None:
-                print("All structures converged or batcher reached max iterations.")
-                break
-            
-            last_active_state = opt_state
-            current_indices = torch.tensor(
-                current_indices_list, dtype=torch.long, device=device
-            )
-
-            steps_this_round = 10
-            for _ in range(steps_this_round):
-                opt_state = update_fn_opt(opt_state)
-            global_step += steps_this_round
-
-            convergence_tensor_for_batcher = convergence_fn(opt_state, None)
-            newly_converged_mask_local = convergence_tensor_for_batcher & (
-                convergence_steps[current_indices] == -1
-            )
-            converged_indices_global = current_indices[newly_converged_mask_local]
-
-            if converged_indices_global.numel() > 0:
-                convergence_steps[converged_indices_global] = global_step
-                converged_tensor_global[converged_indices_global] = True
-                total_converged_frac = converged_tensor_global.sum().item() / total_structures
-                print(
-                    f"{global_step=}: Converged indices {converged_indices_global.tolist()}, "
-                    f"Total converged: {total_converged_frac:.2%}"
-                )
-
-            if global_step % 50 == 0:
-                total_converged_frac = converged_tensor_global.sum().item() / total_structures
-                active_structures = opt_state.n_batches if opt_state else 0
-                print(
-                    f"{global_step=}: Active structures: {active_structures}, "
-                    f"Total converged: {total_converged_frac:.2%}"
-                )
-        
-        final_states_list = batcher.restore_original_order(all_converged_states)
-        final_state_concatenated = ts.concatenate_states(final_states_list)
-
-        if final_state_concatenated is not None and hasattr(final_state_concatenated, 'cell'):
-            print("Final cell parameters (Torch-Sim):")
-            for k_idx in range(final_state_concatenated.n_batches):
-                cell_tensor_k = final_state_concatenated.cell[k_idx].cpu().numpy()
-                ase_cell_k = Cell(cell_tensor_k)
-                params_str = ", ".join([f"{p:.2f}" for p in ase_cell_k.cellpar()])
-                print(f"  Structure {k_idx+1}: Volume={ase_cell_k.volume:.2f} Å³, Params=[{params_str}]")
-        else:
-            print("Final cell parameters (Torch-Sim): Not available (final_state_concatenated is None or has no cell).")
-
-        end_time = time.perf_counter()
-        print(
-            f"Finished Torch-Sim ({ts_md_flavor}, frechet={ts_use_frechet}) in "
-            f"{end_time - start_time:.2f} seconds."
-        )
-        return convergence_steps, final_state_concatenated
-
-    elif optimizer_type == "ase":
-        print(
-            f"\n--- Running ASE optimization: frechet_filter={ase_use_frechet_filter}, "
-            f"force_tol={force_tol} ---"
-        )
-        start_time = time.perf_counter()
-
-        individual_initial_states = initial_state.split()
-        num_structures = len(individual_initial_states)
-        final_ase_atoms_list = []
-        convergence_steps_list = []
-
-        for i, single_sim_state in enumerate(individual_initial_states):
-            print(f"Optimizing structure {i+1}/{num_structures} with ASE...")
-            ase_atoms_orig = ts.io.state_to_atoms(single_sim_state)[0]
-
-            initial_cell_ase = ase_atoms_orig.get_cell()
-            initial_params_str = ", ".join([f"{p:.2f}" for p in initial_cell_ase.cellpar()])
-            print(f"  Initial cell (ASE Structure {i+1}): Volume={initial_cell_ase.volume:.2f} Å³, Params=[{initial_params_str}]")
-            
-            ase_calc_instance = mace_mp_calculator_for_ase(
-                model=MaceUrls.mace_mpa_medium,
-                device=device,
-                default_dtype=str(dtype).split('.')[-1],
-            )
-            ase_atoms_orig.calc = ase_calc_instance
-
-            optim_target_atoms = ase_atoms_orig
-            if ase_use_frechet_filter:
-                print(f"Applying FrechetCellFilter to structure {i+1}")
-                optim_target_atoms = FrechetCellFilter(ase_atoms_orig)
-            
-            dyn = ASEFIRE(optim_target_atoms, trajectory=None, logfile=None)
-
-            try:
-                dyn.run(fmax=force_tol, steps=ase_max_optimizer_steps)
-                if dyn.converged():
-                    convergence_steps_list.append(dyn.nsteps)
-                    print(f"ASE structure {i+1} converged in {dyn.nsteps} steps.")
-                else:
-                    print(
-                        f"ASE optimization for structure {i+1} did not converge within "
-                        f"{ase_max_optimizer_steps} steps. Steps taken: {dyn.nsteps}."
-                    )
-                    convergence_steps_list.append(-1)
-            except Exception as e:
-                print(f"ASE optimization failed for structure {i+1}: {e}")
-                convergence_steps_list.append(-1)
-
-            final_ats_for_print = optim_target_atoms.atoms if ase_use_frechet_filter else ase_atoms_orig
-            final_cell_ase = final_ats_for_print.get_cell()
-            final_params_str = ", ".join([f"{p:.2f}" for p in final_cell_ase.cellpar()])
-            print(f"  Final cell (ASE Structure {i+1}): Volume={final_cell_ase.volume:.2f} Å³, Params=[{final_params_str}]")
-            
-            final_ase_atoms_list.append(final_ats_for_print)
-
-        # Convert list of final ASE atoms objects back to a base SimState first
-        # to easily get positions, cell, etc.
-        # However, ts.io.atoms_to_state might not preserve all attributes needed for GDState directly.
-        # It's better to extract all required components directly from final_ase_atoms_list.
-
-        all_positions = []
-        all_masses = []
-        all_atomic_numbers = []
-        all_cells = []
-        all_batches_for_gd = []
-        final_energies_ase = []
-        final_forces_ase_tensors = [] # List to store force tensors
-
-        current_atom_offset = 0
-        for batch_idx, ats_final in enumerate(final_ase_atoms_list):
-            all_positions.append(torch.tensor(ats_final.get_positions(), device=device, dtype=dtype))
-            all_masses.append(torch.tensor(ats_final.get_masses(), device=device, dtype=dtype))
-            all_atomic_numbers.append(torch.tensor(ats_final.get_atomic_numbers(), device=device, dtype=torch.long))
-            # ASE cell is row-vector, SimState expects column-vector
-            all_cells.append(torch.tensor(ats_final.get_cell().array.T, device=device, dtype=dtype))
-            
-            num_atoms_in_current = len(ats_final)
-            all_batches_for_gd.append(torch.full((num_atoms_in_current,), batch_idx, device=device, dtype=torch.long))
-            current_atom_offset += num_atoms_in_current
-
-            try:
-                if ats_final.calc is None:
-                    print(f"Re-attaching ASE calculator for final energy/forces for structure {batch_idx}.")
-                    temp_calc = mace_mp_calculator_for_ase(
-                        model=MaceUrls.mace_mpa_medium, device=device, default_dtype=str(dtype).split('.')[-1]
-                    )
-                    ats_final.calc = temp_calc
-                final_energies_ase.append(ats_final.get_potential_energy())
-                final_forces_ase_tensors.append(torch.tensor(ats_final.get_forces(), device=device, dtype=dtype))
-            except Exception as e:
-                print(f"Could not get final energy/forces for an ASE structure {batch_idx}: {e}")
-                final_energies_ase.append(float('nan'))
-                # Append a zero tensor of appropriate shape if forces fail, or handle error
-                # For GDState, forces are required. If any structure fails, GDState creation might fail.
-                # We need to ensure all_positions, etc. are also correctly populated even on failure.
-                # For now, let's assume if energy fails, forces might also, and GDState might be problematic.
-                # A robust solution would be to skip failed structures or return None.
-                # For now, let's make forces a zero tensor of expected shape if it fails.
-                if all_positions and len(all_positions[-1]) > 0:
-                     final_forces_ase_tensors.append(torch.zeros_like(all_positions[-1]))
-                else: # Cannot determine shape, this path is problematic
-                     final_forces_ase_tensors.append(torch.empty((0,3), device=device, dtype=dtype))
-
-
-        if not all_positions: # If all optimizations failed early
-            print("Warning: No successful ASE structures to form GDState.")
-            return torch.tensor(convergence_steps_list, dtype=torch.long, device=device), None
-
-
-        # Concatenate all parts
-        concatenated_positions = torch.cat(all_positions, dim=0)
-        concatenated_masses = torch.cat(all_masses, dim=0)
-        concatenated_atomic_numbers = torch.cat(all_atomic_numbers, dim=0)
-        concatenated_cells = torch.stack(all_cells, dim=0) # Cells are (N_batch, 3, 3)
-        concatenated_batch_indices = torch.cat(all_batches_for_gd, dim=0)
-        
-        concatenated_energies = torch.tensor(final_energies_ase, device=device, dtype=dtype)
-        concatenated_forces = torch.cat(final_forces_ase_tensors, dim=0)
-
-        # Check for NaN energies which might cause issues
-        if torch.isnan(concatenated_energies).any():
-            print("Warning: NaN values found in final ASE energies. GDState energy tensor will contain NaNs.")
-            # Consider replacing NaNs if GDState or subsequent ops can't handle them:
-            # concatenated_energies = torch.nan_to_num(concatenated_energies, nan=0.0) # Example replacement
-
-        # Create GDState instance
-        # pbc is global, taken from initial_state
-        final_state_as_gd = GDState(
-            positions=concatenated_positions,
-            masses=concatenated_masses,
-            cell=concatenated_cells,
-            pbc=initial_state.pbc, # Assuming pbc is constant and global
-            atomic_numbers=concatenated_atomic_numbers,
-            batch=concatenated_batch_indices,
-            energy=concatenated_energies,
-            forces=concatenated_forces,
-        )
-        
-        convergence_steps = torch.tensor(convergence_steps_list, dtype=torch.long, device=device)
-
-        end_time = time.perf_counter()
-        print(
-            f"Finished ASE optimization (frechet_filter={ase_use_frechet_filter}) "
-            f"in {end_time - start_time:.2f} seconds."
-        )
-        return convergence_steps, final_state_as_gd
     else:
-        raise ValueError(f"Unknown optimizer_type: {optimizer_type}")
+        print(
+            "Final cell parameters (Torch-Sim): Not available (final_state_concatenated is None or has no cell)."
+        )
+
+    end_time = time.perf_counter()
+    print(
+        f"Finished Torch-Sim ({ts_md_flavor}, frechet={ts_use_frechet}) in "
+        f"{end_time - start_time:.2f} seconds."
+    )
+    return convergence_steps, final_state_concatenated
+
+
+def run_optimization_ase(
+    *,
+    initial_state: SimState,
+    ase_use_frechet_filter: bool,
+    force_tol: float,
+    max_steps_ase: int,
+) -> tuple[torch.Tensor, GDState | None]:
+    """Runs ASE optimization and returns convergence steps and final state."""
+    print(
+        f"\n--- Running ASE optimization: frechet_filter={ase_use_frechet_filter}, "
+        f"force_tol={force_tol} ---"
+    )
+    start_time = time.perf_counter()
+
+    individual_initial_states = initial_state.split()
+    num_structures = len(individual_initial_states)
+    final_ase_atoms_list = []
+    convergence_steps_list = []
+
+    for i, single_sim_state in enumerate(individual_initial_states):
+        print(f"Optimizing structure {i + 1}/{num_structures} with ASE...")
+        ase_atoms_orig = ts.io.state_to_atoms(single_sim_state)[0]
+
+        initial_cell_ase = ase_atoms_orig.get_cell()
+        initial_params_str = ", ".join([f"{p:.2f}" for p in initial_cell_ase.cellpar()])
+        print(
+            f"  Initial cell (ASE Structure {i + 1}): Volume={initial_cell_ase.volume:.2f} Å³, Params=[{initial_params_str}]"
+        )
+
+        ase_calc_instance = mace_mp_calculator_for_ase(
+            model=MaceUrls.mace_mpa_medium,
+            device=device,
+            default_dtype=str(dtype).split(".")[-1],
+        )
+        ase_atoms_orig.calc = ase_calc_instance
+
+        optim_target_atoms = ase_atoms_orig
+        if ase_use_frechet_filter:
+            print(f"Applying FrechetCellFilter to structure {i + 1}")
+            optim_target_atoms = FrechetCellFilter(ase_atoms_orig)
+
+        dyn = ASEFIRE(optim_target_atoms, trajectory=None, logfile=None)
+
+        try:
+            dyn.run(fmax=force_tol, steps=max_steps_ase)  # Use passed max_steps_ase
+            if dyn.converged():
+                convergence_steps_list.append(dyn.nsteps)
+                print(f"ASE structure {i + 1} converged in {dyn.nsteps} steps.")
+            else:
+                print(
+                    f"ASE optimization for structure {i + 1} did not converge within "
+                    f"{max_steps_ase} steps. Steps taken: {dyn.nsteps}."
+                )
+                convergence_steps_list.append(-1)
+        except Exception as e:
+            print(f"ASE optimization failed for structure {i + 1}: {e}")
+            convergence_steps_list.append(-1)
+
+        final_ats_for_print = (
+            optim_target_atoms.atoms if ase_use_frechet_filter else ase_atoms_orig
+        )
+        final_cell_ase = final_ats_for_print.get_cell()
+        final_params_str = ", ".join([f"{p:.2f}" for p in final_cell_ase.cellpar()])
+        print(
+            f"  Final cell (ASE Structure {i + 1}): Volume={final_cell_ase.volume:.2f} Å³, Params=[{final_params_str}]"
+        )
+
+        final_ase_atoms_list.append(final_ats_for_print)
+
+    # Convert list of final ASE atoms objects back to a base SimState first
+    # to easily get positions, cell, etc.
+    # However, ts.io.atoms_to_state might not preserve all attributes needed for GDState directly.
+    # It's better to extract all required components directly from final_ase_atoms_list.
+
+    all_positions = []
+    all_masses = []
+    all_atomic_numbers = []
+    all_cells = []
+    all_batches_for_gd = []
+    final_energies_ase = []
+    final_forces_ase_tensors = []  # List to store force tensors
+
+    current_atom_offset = 0
+    for batch_idx, ats_final in enumerate(final_ase_atoms_list):
+        all_positions.append(
+            torch.tensor(ats_final.get_positions(), device=device, dtype=dtype)
+        )
+        all_masses.append(
+            torch.tensor(ats_final.get_masses(), device=device, dtype=dtype)
+        )
+        all_atomic_numbers.append(
+            torch.tensor(ats_final.get_atomic_numbers(), device=device, dtype=torch.long)
+        )
+        # ASE cell is row-vector, SimState expects column-vector
+        all_cells.append(
+            torch.tensor(ats_final.get_cell().array.T, device=device, dtype=dtype)
+        )
+
+        num_atoms_in_current = len(ats_final)
+        all_batches_for_gd.append(
+            torch.full(
+                (num_atoms_in_current,), batch_idx, device=device, dtype=torch.long
+            )
+        )
+        current_atom_offset += num_atoms_in_current
+
+        try:
+            if ats_final.calc is None:
+                print(
+                    f"Re-attaching ASE calculator for final energy/forces for structure {batch_idx}."
+                )
+                temp_calc = mace_mp_calculator_for_ase(
+                    model=MaceUrls.mace_mpa_medium,
+                    device=device,
+                    default_dtype=str(dtype).split(".")[-1],
+                )
+                ats_final.calc = temp_calc
+            final_energies_ase.append(ats_final.get_potential_energy())
+            final_forces_ase_tensors.append(
+                torch.tensor(ats_final.get_forces(), device=device, dtype=dtype)
+            )
+        except Exception as e:
+            print(
+                f"Could not get final energy/forces for an ASE structure {batch_idx}: {e}"
+            )
+            final_energies_ase.append(float("nan"))
+            # Append a zero tensor of appropriate shape if forces fail, or handle error
+            # For GDState, forces are required. If any structure fails, GDState creation might fail.
+            # We need to ensure all_positions, etc. are also correctly populated even on failure.
+            # For now, let's assume if energy fails, forces might also, and GDState might be problematic.
+            # A robust solution would be to skip failed structures or return None.
+            # For now, let's make forces a zero tensor of expected shape if it fails.
+            if all_positions and len(all_positions[-1]) > 0:
+                final_forces_ase_tensors.append(torch.zeros_like(all_positions[-1]))
+            else:  # Cannot determine shape, this path is problematic
+                final_forces_ase_tensors.append(
+                    torch.empty((0, 3), device=device, dtype=dtype)
+                )
+
+    if not all_positions:  # If all optimizations failed early
+        print("Warning: No successful ASE structures to form GDState.")
+        return torch.tensor(convergence_steps_list, dtype=torch.long, device=device), None
+
+    # Concatenate all parts
+    concatenated_positions = torch.cat(all_positions, dim=0)
+    concatenated_masses = torch.cat(all_masses, dim=0)
+    concatenated_atomic_numbers = torch.cat(all_atomic_numbers, dim=0)
+    concatenated_cells = torch.stack(all_cells, dim=0)  # Cells are (N_batch, 3, 3)
+    concatenated_batch_indices = torch.cat(all_batches_for_gd, dim=0)
+
+    concatenated_energies = torch.tensor(final_energies_ase, device=device, dtype=dtype)
+    concatenated_forces = torch.cat(final_forces_ase_tensors, dim=0)
+
+    # Check for NaN energies which might cause issues
+    if torch.isnan(concatenated_energies).any():
+        print(
+            "Warning: NaN values found in final ASE energies. GDState energy tensor will contain NaNs."
+        )
+        # Consider replacing NaNs if GDState or subsequent ops can't handle them:
+        # concatenated_energies = torch.nan_to_num(concatenated_energies, nan=0.0) # Example replacement
+
+    # Create GDState instance
+    # pbc is global, taken from initial_state
+    final_state_as_gd = GDState(
+        positions=concatenated_positions,
+        masses=concatenated_masses,
+        cell=concatenated_cells,
+        pbc=initial_state.pbc,  # Assuming pbc is constant and global
+        atomic_numbers=concatenated_atomic_numbers,
+        batch=concatenated_batch_indices,
+        energy=concatenated_energies,
+        forces=concatenated_forces,
+    )
+
+    convergence_steps = torch.tensor(
+        convergence_steps_list, dtype=torch.long, device=device
+    )
+
+    end_time = time.perf_counter()
+    print(
+        f"Finished ASE optimization (frechet_filter={ase_use_frechet_filter}) "
+        f"in {end_time - start_time:.2f} seconds."
+    )
+    return convergence_steps, final_state_as_gd
 
 
 # --- Main Script ---
@@ -401,113 +437,150 @@ force_tol = 0.05
 configs_to_run = [
     {
         "name": "torch-sim VV-FIRE (PosOnly)",
-        "type": "torch_sim", "ts_md_flavor": "vv_fire", "ts_use_frechet": False,
+        "type": "torch_sim",
+        "ts_md_flavor": "vv_fire",
+        "ts_use_frechet": False,
     },
     {
         "name": "torch-sim ASE-FIRE (PosOnly)",
-        "type": "torch_sim", "ts_md_flavor": "ase_fire", "ts_use_frechet": False,
+        "type": "torch_sim",
+        "ts_md_flavor": "ase_fire",
+        "ts_use_frechet": False,
     },
     {
         "name": "torch-sim VV-FIRE (Frechet Cell)",
-        "type": "torch_sim", "ts_md_flavor": "vv_fire", "ts_use_frechet": True,
+        "type": "torch_sim",
+        "ts_md_flavor": "vv_fire",
+        "ts_use_frechet": True,
     },
     {
         "name": "torch-sim ASE-FIRE (Frechet Cell)",
-        "type": "torch_sim", "ts_md_flavor": "ase_fire", "ts_use_frechet": True,
+        "type": "torch_sim",
+        "ts_md_flavor": "ase_fire",
+        "ts_use_frechet": True,
     },
     {
-        "name": "ASE FIRE (Native, PosOnly)", # Corrected name: Only optimizes positions without a cell filter
-        "type": "ase", "ase_use_frechet_filter": False,
+        "name": "ASE FIRE (Native, PosOnly)",  # Corrected name: Only optimizes positions without a cell filter
+        "type": "ase",
+        "ase_use_frechet_filter": False,
     },
     {
         "name": "ASE FIRE (Native Frechet Filter, CellOpt)",
-        "type": "ase", "ase_use_frechet_filter": True,
+        "type": "ase",
+        "ase_use_frechet_filter": True,
     },
 ]
 
-results_all = {}
+all_results = {}
 
 for config_run in configs_to_run:
     print(f"\n\nStarting configuration: {config_run['name']}")
     # Get relevant params, providing defaults where necessary for the run_optimization call
     optimizer_type_val = config_run["type"]
-    ts_md_flavor_val = config_run.get("ts_md_flavor") # Will be None for ASE type, handled by assert
+    # Will be None for ASE type, handled by assert
+    ts_md_flavor_val = config_run.get("ts_md_flavor")
     ts_use_frechet_val = config_run.get("ts_use_frechet", False)
     ase_use_frechet_filter_val = config_run.get("ase_use_frechet_filter", False)
 
-    steps, final_state_opt = run_optimization(
-        initial_state=state.clone(), # Use a fresh clone for each run
-        optimizer_type=optimizer_type_val,
-        ts_md_flavor=ts_md_flavor_val,
-        ts_use_frechet=ts_use_frechet_val,
-        ase_use_frechet_filter=ase_use_frechet_filter_val,
-        force_tol=force_tol,
-    )
-    results_all[config_run["name"]] = {"steps": steps, "final_state": final_state_opt}
+    steps: torch.Tensor | None = None
+    final_state_opt: SimState | GDState | None = None
+
+    if optimizer_type_val == "torch_sim":
+        assert ts_md_flavor_val is not None, "ts_md_flavor must be provided for torch_sim"
+        steps, final_state_opt = run_optimization_ts(
+            initial_state=state.clone(),  # Use a fresh clone for each run
+            ts_md_flavor=ts_md_flavor_val,
+            ts_use_frechet=ts_use_frechet_val,
+            force_tol=force_tol,
+            max_iterations_ts=max_iterations,  # Pass the global max_iterations
+        )
+    elif optimizer_type_val == "ase":
+        steps, final_state_opt = run_optimization_ase(
+            initial_state=state.clone(),  # Use a fresh clone for each run
+            ase_use_frechet_filter=ase_use_frechet_filter_val,
+            force_tol=force_tol,
+            max_steps_ase=ase_max_optimizer_steps,  # Pass the global ase_max_optimizer_steps
+        )
+    else:
+        raise ValueError(f"Unknown optimizer_type: {optimizer_type_val}")
+
+    all_results[config_run["name"]] = {"steps": steps, "final_state": final_state_opt}
 
 
 print("\n\n--- Overall Comparison ---")
 print(f"{force_tol=:.2f} eV/Å")
 print(f"Initial energies: {[f'{e.item():.3f}' for e in initial_energies]} eV")
 
-for name, result_data in results_all.items():
+for name, result_data in all_results.items():
     final_state_res = result_data["final_state"]
     steps_res = result_data["steps"]
     print(f"\nResults for: {name}")
-    if final_state_res is not None and hasattr(final_state_res, 'energy') and final_state_res.energy is not None:
-        energy_str = [f'{e.item():.3f}' for e in final_state_res.energy]
+    if (
+        final_state_res is not None
+        and hasattr(final_state_res, "energy")
+        and final_state_res.energy is not None
+    ):
+        energy_str = [f"{e.item():.3f}" for e in final_state_res.energy]
         print(f"  Final energies: {energy_str} eV")
     else:
-        print(f"  Final energies: Not available or state is None")
+        print("  Final energies: Not available or state is None")
     print(f"  Convergence steps: {steps_res.tolist()}")
-    
+
     not_converged_indices = torch.where(steps_res == -1)[0].tolist()
     if not_converged_indices:
         print(f"  Did not converge for structure indices: {not_converged_indices}")
 
 # Mean Displacement Comparisons
 comparison_pairs = [
-    ("torch-sim ASE-FIRE (PosOnly)", "ASE FIRE (Native, PosOnly)"), 
+    ("torch-sim ASE-FIRE (PosOnly)", "ASE FIRE (Native, PosOnly)"),
     ("torch-sim ASE-FIRE (Frechet Cell)", "ASE FIRE (Native Frechet Filter, CellOpt)"),
     ("torch-sim VV-FIRE (Frechet Cell)", "ASE FIRE (Native Frechet Filter, CellOpt)"),
-    ("torch-sim VV-FIRE (PosOnly)", "ASE FIRE (Native, PosOnly)"), 
+    ("torch-sim VV-FIRE (PosOnly)", "ASE FIRE (Native, PosOnly)"),
 ]
 
 for name1, name2 in comparison_pairs:
-    if name1 in results_all and name2 in results_all:
-        state1 = results_all[name1]["final_state"]
-        state2 = results_all[name2]["final_state"]
+    if name1 in all_results and name2 in all_results:
+        state1 = all_results[name1]["final_state"]
+        state2 = all_results[name2]["final_state"]
 
         if state1 is None or state2 is None:
             print(f"\nCannot compare {name1} and {name2}, one or both states are None.")
             continue
-        
+
         state1_list = state1.split()
-        
+
         state2_list = state2.split()
-        
+
         if len(state1_list) != len(state2_list):
-            print(f"\nCannot compare {name1} and {name2}, different number of structures.")
+            print(
+                f"\nCannot compare {name1} and {name2}, different number of structures."
+            )
             continue
 
         mean_displacements = []
         for s1, s2 in zip(state1_list, state2_list, strict=True):
-            if s1.n_atoms == 0 or s2.n_atoms == 0 : # Handle empty states if they occur
-                mean_displacements.append(float('nan'))
+            if s1.n_atoms == 0 or s2.n_atoms == 0:  # Handle empty states if they occur
+                mean_displacements.append(float("nan"))
                 continue
             pos1_centered = s1.positions - s1.positions.mean(dim=0, keepdim=True)
             pos2_centered = s2.positions - s2.positions.mean(dim=0, keepdim=True)
             if pos1_centered.shape != pos2_centered.shape:
-                 print(f"Warning: Shape mismatch for {name1} vs {name2} in structure. Skipping displacement calc.")
-                 mean_displacements.append(float('nan'))
-                 continue
+                print(
+                    f"Warning: Shape mismatch for {name1} vs {name2} in structure. Skipping displacement calc."
+                )
+                mean_displacements.append(float("nan"))
+                continue
             displacement = torch.norm(pos1_centered - pos2_centered, dim=1)
             mean_disp = torch.mean(displacement).item()
             mean_displacements.append(mean_disp)
-        
-        print(f"\nMean Disp ({name1} vs {name2}): {[f'{d:.4f}' for d in mean_displacements]} Å")
+
+        print(
+            f"\nMean Disp ({name1} vs {name2}): {[f'{d:.4f}' for d in mean_displacements]} Å"
+        )
     else:
-        print(f"\nSkipping displacement comparison for ({name1} vs {name2}), one or both results missing.")
+        print(
+            f"\nSkipping displacement comparison for ({name1} vs {name2}), one or both results missing."
+        )
 
 
 # --- Plotting Results ---
@@ -515,63 +588,94 @@ for name1, name2 in comparison_pairs:
 # Names for the structures for plotting labels
 original_structure_formulas = [ats.get_chemical_formula() for ats in atoms_list]
 # Make them more concise if needed:
-structure_names = ["Si_bulk", "Cu_bulk", "Fe_bulk", "Si_vac", "Cu_vac", "Fe_vac"] # Updated for 6 structures
+structure_names = [
+    "Si_bulk",
+    "Cu_bulk",
+    "Fe_bulk",
+    "Si_vac",
+    "Cu_vac",
+    "Fe_vac",
+]  # Updated for 6 structures
 if len(structure_names) != len(atoms_list):
-    print(f"Warning: Mismatch between custom structure_names ({len(structure_names)}) and atoms_list ({len(atoms_list)}). Using custom names.")
+    print(
+        f"Warning: Mismatch between custom structure_names ({len(structure_names)}) and atoms_list ({len(atoms_list)}). Using custom names."
+    )
 num_structures_plot = len(structure_names)
 
 
 # --- Plot 1: Convergence Steps (Multi-bar per structure) ---
-plot_methods_fig1 = list(results_all.keys())
+plot_methods_fig1 = list(all_results.keys())
 num_methods_fig1 = len(plot_methods_fig1)
 # Initialize with NaNs, so if a method fails completely, its bars are missing or clearly marked
-steps_data_fig1 = np.full((num_structures_plot, num_methods_fig1), np.nan) 
+steps_data_fig1 = np.full((num_structures_plot, num_methods_fig1), np.nan)
 
 for method_idx, method_name in enumerate(plot_methods_fig1):
-    result_data = results_all[method_name]
+    result_data = all_results[method_name]
     if result_data["final_state"] is None or result_data["steps"] is None:
         # steps_data_fig1[:, method_idx] = np.nan # Already initialized with NaN
         print(f"Plot1: Skipping steps for {method_name} as final_state or steps is None.")
         continue
-    
+
     steps_tensor = result_data["steps"].cpu().numpy()
-    penalty_steps = ase_max_optimizer_steps + 100 
+    penalty_steps = ase_max_optimizer_steps + 100
     steps_plot_values = np.where(steps_tensor == -1, penalty_steps, steps_tensor)
 
     if len(steps_plot_values) == num_structures_plot:
         steps_data_fig1[:, method_idx] = steps_plot_values
     elif len(steps_plot_values) > num_structures_plot:
-        print(f"Warning: More step values ({len(steps_plot_values)}) than structure names ({num_structures_plot}) for {method_name}. Truncating.")
+        print(
+            f"Warning: More step values ({len(steps_plot_values)}) than structure names ({num_structures_plot}) for {method_name}. Truncating."
+        )
         steps_data_fig1[:, method_idx] = steps_plot_values[:num_structures_plot]
     elif len(steps_plot_values) < num_structures_plot:
-        print(f"Warning: Fewer step values ({len(steps_plot_values)}) than structure names ({num_structures_plot}) for {method_name}. Padding with NaN.")
-        steps_data_fig1[:len(steps_plot_values), method_idx] = steps_plot_values
+        print(
+            f"Warning: Fewer step values ({len(steps_plot_values)}) than structure names ({num_structures_plot}) for {method_name}. Padding with NaN."
+        )
+        steps_data_fig1[: len(steps_plot_values), method_idx] = steps_plot_values
         # The rest will remain NaN due to initialization
 
-fig1, ax1 = plt.subplots(figsize=(17, 8)) # Wider for 6 structures + legend
-x_fig1 = np.arange(num_structures_plot) 
-width_fig1 = 0.8 / num_methods_fig1 
+fig1, ax1 = plt.subplots(figsize=(17, 8))  # Wider for 6 structures + legend
+x_fig1 = np.arange(num_structures_plot)
+width_fig1 = 0.8 / num_methods_fig1
 
 rects_all_fig1 = []
 for i in range(num_methods_fig1):
-    rects = ax1.bar(x_fig1 - 0.4 + (i + 0.5) * width_fig1, steps_data_fig1[:, i], width_fig1, label=plot_methods_fig1[i])
+    rects = ax1.bar(
+        x_fig1 - 0.4 + (i + 0.5) * width_fig1,
+        steps_data_fig1[:, i],
+        width_fig1,
+        label=plot_methods_fig1[i],
+    )
     rects_all_fig1.append(rects)
     for bar_idx, bar_val in enumerate(steps_data_fig1[:, i]):
-        if bar_idx < len(results_all[plot_methods_fig1[i]]["steps"]): # Check bounds
-            original_step_val = results_all[plot_methods_fig1[i]]["steps"].cpu().numpy()[bar_idx]
-            if original_step_val == -1 and not np.isnan(bar_val): # Check if it was a penalty bar
-                 ax1.text(rects[bar_idx].get_x() + rects[bar_idx].get_width() / 2., 
-                          rects[bar_idx].get_height() - 10, 
-                          'NC', ha='center', va='top', color='white', fontsize=7, weight='bold')
+        if bar_idx < len(all_results[plot_methods_fig1[i]]["steps"]):  # Check bounds
+            original_step_val = (
+                all_results[plot_methods_fig1[i]]["steps"].cpu().numpy()[bar_idx]
+            )
+            if original_step_val == -1 and not np.isnan(
+                bar_val
+            ):  # Check if it was a penalty bar
+                ax1.text(
+                    rects[bar_idx].get_x() + rects[bar_idx].get_width() / 2.0,
+                    rects[bar_idx].get_height() - 10,
+                    "NC",
+                    ha="center",
+                    va="top",
+                    color="white",
+                    fontsize=7,
+                    weight="bold",
+                )
 
-ax1.set_ylabel('Convergence Steps (NC = Not Converged, shown at penalty)')
-ax1.set_xlabel('Structure')
-ax1.set_title('Convergence Steps per Structure and Method')
+ax1.set_ylabel("Convergence Steps (NC = Not Converged, shown at penalty)")
+ax1.set_xlabel("Structure")
+ax1.set_title("Convergence Steps per Structure and Method")
 ax1.set_xticks(x_fig1)
 ax1.set_xticklabels(structure_names, rotation=45, ha="right")
-ax1.legend(title="Optimization Method", bbox_to_anchor=(1.02, 1), loc='upper left') # Adjusted legend position
-ax1.grid(True, axis='y', linestyle='--', alpha=0.7)
-plt.tight_layout(rect=[0, 0, 0.83, 1]) # Fine-tune rect for legend
+ax1.legend(
+    title="Optimization Method", bbox_to_anchor=(1.02, 1), loc="upper left"
+)  # Adjusted legend position
+ax1.grid(True, axis="y", linestyle="--", alpha=0.7)
+plt.tight_layout(rect=[0, 0, 0.83, 1])  # Fine-tune rect for legend
 
 
 # --- Plot 2: Average Final Energy Difference from Baselines ---
@@ -580,37 +684,51 @@ baseline_ase_frechet = "ASE FIRE (Native Frechet Filter, CellOpt)"
 avg_energy_diffs_fig2 = []
 plot_names_fig2 = []
 
-baseline_pos_only_data = results_all.get(baseline_ase_pos_only)
-baseline_frechet_data = results_all.get(baseline_ase_frechet)
+baseline_pos_only_data = all_results.get(baseline_ase_pos_only)
+baseline_frechet_data = all_results.get(baseline_ase_frechet)
 
-for name, result_data in results_all.items():
+for name, result_data in all_results.items():
     if result_data["final_state"] is None or result_data["final_state"].energy is None:
         print(f"Plot2: Skipping energy diff for {name} as final_state or energy is None.")
-        if name not in plot_names_fig2: plot_names_fig2.append(name) # Keep name for consistent bar count
-        avg_energy_diffs_fig2.append(np.nan) # Add NaN if data missing
+        if name not in plot_names_fig2:
+            plot_names_fig2.append(name)  # Keep name for consistent bar count
+        avg_energy_diffs_fig2.append(np.nan)  # Add NaN if data missing
         continue
 
     # Ensure name is added if not already by a skip
-    if name not in plot_names_fig2: plot_names_fig2.append(name)
-        
+    if name not in plot_names_fig2:
+        plot_names_fig2.append(name)
+
     current_energies = result_data["final_state"].energy.cpu().numpy()
-    
+
     chosen_baseline_energies = None
     is_baseline_self = False
     processed_current_name = False
 
     if name == baseline_ase_pos_only or name == baseline_ase_frechet:
-        avg_energy_diffs_fig2.append(0.0) 
+        avg_energy_diffs_fig2.append(0.0)
         is_baseline_self = True
         processed_current_name = True
     elif "torch-sim" in name:
         if "PosOnly" in name:
-            if baseline_pos_only_data and baseline_pos_only_data["final_state"] is not None and baseline_pos_only_data["final_state"].energy is not None:
-                chosen_baseline_energies = baseline_pos_only_data["final_state"].energy.cpu().numpy()
+            if (
+                baseline_pos_only_data
+                and baseline_pos_only_data["final_state"] is not None
+                and baseline_pos_only_data["final_state"].energy is not None
+            ):
+                chosen_baseline_energies = (
+                    baseline_pos_only_data["final_state"].energy.cpu().numpy()
+                )
         elif "Frechet Cell" in name:
-            if baseline_frechet_data and baseline_frechet_data["final_state"] is not None and baseline_frechet_data["final_state"].energy is not None:
-                chosen_baseline_energies = baseline_frechet_data["final_state"].energy.cpu().numpy()
-    
+            if (
+                baseline_frechet_data
+                and baseline_frechet_data["final_state"] is not None
+                and baseline_frechet_data["final_state"].energy is not None
+            ):
+                chosen_baseline_energies = (
+                    baseline_frechet_data["final_state"].energy.cpu().numpy()
+                )
+
     if not is_baseline_self and not processed_current_name:
         if chosen_baseline_energies is not None:
             if current_energies.shape == chosen_baseline_energies.shape:
@@ -618,12 +736,20 @@ for name, result_data in results_all.items():
                 avg_energy_diffs_fig2.append(energy_diff)
             else:
                 avg_energy_diffs_fig2.append(np.nan)
-                print(f"Plot2: Shape mismatch for energy comparison: {name} vs its baseline. "
-                      f"{current_energies.shape} vs {chosen_baseline_energies.shape}")
+                print(
+                    f"Plot2: Shape mismatch for energy comparison: {name} vs its baseline. "
+                    f"{current_energies.shape} vs {chosen_baseline_energies.shape}"
+                )
         else:
-            print(f"Plot2: No appropriate baseline for {name} or baseline data missing. Setting energy diff to NaN.")
+            print(
+                f"Plot2: No appropriate baseline for {name} or baseline data missing. Setting energy diff to NaN."
+            )
             avg_energy_diffs_fig2.append(np.nan)
-    elif not processed_current_name and name not in [n for n,v in zip(plot_names_fig2, avg_energy_diffs_fig2) if not np.isnan(v)] : # Handle cases not covered
+    elif not processed_current_name and name not in [
+        n
+        for n, v in zip(plot_names_fig2, avg_energy_diffs_fig2, strict=False)
+        if not np.isnan(v)
+    ]:  # Handle cases not covered
         print(f"Plot2: Fallback for {name}, setting energy diff to NaN.")
         avg_energy_diffs_fig2.append(np.nan)
 
@@ -633,84 +759,129 @@ for name, result_data in results_all.items():
 # A more robust way is to build them in parallel.
 final_plot_names_fig2 = []
 final_avg_energy_diffs_fig2 = []
-all_method_names_sorted = sorted(list(results_all.keys())) # Use a fixed order
+all_method_names_sorted = sorted(list(all_results.keys()))  # Use a fixed order
 
 for name in all_method_names_sorted:
-    result_data = results_all[name]
+    result_data = all_results[name]
     final_plot_names_fig2.append(name)
     if result_data["final_state"] is None or result_data["final_state"].energy is None:
         final_avg_energy_diffs_fig2.append(np.nan)
         continue
-    
+
     current_energies = result_data["final_state"].energy.cpu().numpy()
-    energy_to_append = np.nan # Default to NaN
+    energy_to_append = np.nan  # Default to NaN
 
     if name == baseline_ase_pos_only or name == baseline_ase_frechet:
         energy_to_append = 0.0
     elif "torch-sim" in name:
         baseline_to_use_energies = None
         if "PosOnly" in name:
-            if baseline_pos_only_data and baseline_pos_only_data["final_state"] is not None and baseline_pos_only_data["final_state"].energy is not None:
-                baseline_to_use_energies = baseline_pos_only_data["final_state"].energy.cpu().numpy()
+            if (
+                baseline_pos_only_data
+                and baseline_pos_only_data["final_state"] is not None
+                and baseline_pos_only_data["final_state"].energy is not None
+            ):
+                baseline_to_use_energies = (
+                    baseline_pos_only_data["final_state"].energy.cpu().numpy()
+                )
         elif "Frechet Cell" in name:
-            if baseline_frechet_data and baseline_frechet_data["final_state"] is not None and baseline_frechet_data["final_state"].energy is not None:
-                baseline_to_use_energies = baseline_frechet_data["final_state"].energy.cpu().numpy()
-        
+            if (
+                baseline_frechet_data
+                and baseline_frechet_data["final_state"] is not None
+                and baseline_frechet_data["final_state"].energy is not None
+            ):
+                baseline_to_use_energies = (
+                    baseline_frechet_data["final_state"].energy.cpu().numpy()
+                )
+
         if baseline_to_use_energies is not None:
             if current_energies.shape == baseline_to_use_energies.shape:
                 energy_to_append = np.mean(current_energies - baseline_to_use_energies)
             else:
-                print(f"Plot2: Shape mismatch for {name} ({current_energies.shape}) vs baseline ({baseline_to_use_energies.shape}).")
+                print(
+                    f"Plot2: Shape mismatch for {name} ({current_energies.shape}) vs baseline ({baseline_to_use_energies.shape})."
+                )
     final_avg_energy_diffs_fig2.append(energy_to_append)
 
 
 fig2, ax2 = plt.subplots(figsize=(12, 7))
-bars_fig2 = ax2.bar(final_plot_names_fig2, final_avg_energy_diffs_fig2, color='lightcoral')
-ax2.set_ylabel('Avg. Final Energy Diff. from Corresponding ASE Baseline (eV)')
-ax2.set_xlabel('Optimization Method')
-ax2.set_title('Average Final Energy Difference from ASE Baselines')
-ax2.axhline(0, color='black', linewidth=0.8, linestyle='--')
+bars_fig2 = ax2.bar(
+    final_plot_names_fig2, final_avg_energy_diffs_fig2, color="lightcoral"
+)
+ax2.set_ylabel("Avg. Final Energy Diff. from Corresponding ASE Baseline (eV)")
+ax2.set_xlabel("Optimization Method")
+ax2.set_title("Average Final Energy Difference from ASE Baselines")
+ax2.axhline(0, color="black", linewidth=0.8, linestyle="--")
 
 for bar in bars_fig2:
     yval = bar.get_height()
-    if not np.isnan(yval): 
-        text_y_offset = 0.001 if yval >= 0 else -0.005 
-        va_align = 'bottom' if yval >=0 else 'top'
-        ax2.text(bar.get_x() + bar.get_width()/2.0, yval + text_y_offset, 
-                 f"{yval:.3f}", ha='center', va=va_align, fontsize=8, color='black')
+    if not np.isnan(yval):
+        text_y_offset = 0.001 if yval >= 0 else -0.005
+        va_align = "bottom" if yval >= 0 else "top"
+        ax2.text(
+            bar.get_x() + bar.get_width() / 2.0,
+            yval + text_y_offset,
+            f"{yval:.3f}",
+            ha="center",
+            va=va_align,
+            fontsize=8,
+            color="black",
+        )
 
 plt.xticks(rotation=45, ha="right")
 plt.tight_layout()
 
 
 # --- Plot 3: Mean Displacement from ASE Counterparts (Multi-bar per structure) ---
-comparison_pairs_plot3_defs = [ # (ts_method_name, ase_method_name, short_label_for_legend)
-    ("torch-sim ASE-FIRE (PosOnly)", baseline_ase_pos_only, "TS ASE PosOnly vs ASE Native"),
+comparison_pairs_plot3_defs = [  # (ts_method_name, ase_method_name, short_label_for_legend)
+    (
+        "torch-sim ASE-FIRE (PosOnly)",
+        baseline_ase_pos_only,
+        "TS ASE PosOnly vs ASE Native",
+    ),
     ("torch-sim VV-FIRE (PosOnly)", baseline_ase_pos_only, "TS VV PosOnly vs ASE Native"),
-    ("torch-sim ASE-FIRE (Frechet Cell)", baseline_ase_frechet, "TS ASE Frechet vs ASE Frechet"),
-    ("torch-sim VV-FIRE (Frechet Cell)", baseline_ase_frechet, "TS VV Frechet vs ASE Frechet"),
+    (
+        "torch-sim ASE-FIRE (Frechet Cell)",
+        baseline_ase_frechet,
+        "TS ASE Frechet vs ASE Frechet",
+    ),
+    (
+        "torch-sim VV-FIRE (Frechet Cell)",
+        baseline_ase_frechet,
+        "TS VV Frechet vs ASE Frechet",
+    ),
 ]
 num_comparison_pairs_plot3 = len(comparison_pairs_plot3_defs)
 # rows: structures, cols: comparison_pair
-disp_data_fig3 = np.full((num_structures_plot, num_comparison_pairs_plot3), np.nan) 
+disp_data_fig3 = np.full((num_structures_plot, num_comparison_pairs_plot3), np.nan)
 legend_labels_fig3 = []
 
-for pair_idx, (ts_method_name, ase_method_name, plot_label) in enumerate(comparison_pairs_plot3_defs):
+for pair_idx, (ts_method_name, ase_method_name, plot_label) in enumerate(
+    comparison_pairs_plot3_defs
+):
     legend_labels_fig3.append(plot_label)
-    if ts_method_name in results_all and ase_method_name in results_all:
-        state1_data = results_all[ts_method_name]
-        state2_data = results_all[ase_method_name]
+    if ts_method_name in all_results and ase_method_name in all_results:
+        state1_data = all_results[ts_method_name]
+        state2_data = all_results[ase_method_name]
 
         if state1_data["final_state"] is None or state2_data["final_state"] is None:
-            print(f"Plot3: Skipping displacement for {plot_label} due to missing state data.")
+            print(
+                f"Plot3: Skipping displacement for {plot_label} due to missing state data."
+            )
             # Data remains NaN
             continue
-        
+
         state1_list = state1_data["final_state"].split()
         state2_list = state2_data["final_state"].split()
-        
-        if len(state1_list) != len(state2_list) or len(state1_list) != num_structures_plot :
-            print(f"Plot3: Structure count mismatch for {plot_label}. Expected {num_structures_plot}, got S1:{len(state1_list)}, S2:{len(state2_list)}")
+
+        if (
+            len(state1_list) != len(state2_list)
+            or len(state1_list) != num_structures_plot
+        ):
+            print(
+                f"Plot3: Structure count mismatch for {plot_label}. "
+                f"Expected {num_structures_plot}, got S1:{len(state1_list)}, S2:{len(state2_list)}"
+            )
             # Data remains NaN
             continue
 
@@ -724,31 +895,40 @@ for pair_idx, (ts_method_name, ase_method_name, plot_label) in enumerate(compari
             displacement = torch.norm(pos1_centered - pos2_centered, dim=1)
             mean_disp = torch.mean(displacement).item()
             mean_displacements_for_this_pair.append(mean_disp)
-        
+
         if len(mean_displacements_for_this_pair) == num_structures_plot:
             disp_data_fig3[:, pair_idx] = np.array(mean_displacements_for_this_pair)
-        else: # Should not happen if previous checks pass
+        else:  # Should not happen if previous checks pass
             print(f"Plot3: Inner loop displacement calculation mismatch for {plot_label}")
 
     else:
         print(f"Plot3: Missing data for methods in pair: {plot_label}.")
         # Data remains NaN
 
-fig3, ax3 = plt.subplots(figsize=(17, 8)) # Wider for 6 structures + legend
-x_fig3 = np.arange(num_structures_plot) 
+fig3, ax3 = plt.subplots(figsize=(17, 8))  # Wider for 6 structures + legend
+x_fig3 = np.arange(num_structures_plot)
 width_fig3 = 0.8 / num_comparison_pairs_plot3
 
 for i in range(num_comparison_pairs_plot3):
-    ax3.bar(x_fig3 - 0.4 + (i + 0.5) * width_fig3, disp_data_fig3[:, i], width_fig3, label=legend_labels_fig3[i])
+    ax3.bar(
+        x_fig3 - 0.4 + (i + 0.5) * width_fig3,
+        disp_data_fig3[:, i],
+        width_fig3,
+        label=legend_labels_fig3[i],
+    )
 
-ax3.set_ylabel('Mean Atomic Displacement (Å) to ASE Counterpart')
-ax3.set_xlabel('Structure')
-ax3.set_title('Mean Displacement of Torch-Sim Methods to ASE Counterparts (per Structure)')
+ax3.set_ylabel("Mean Atomic Displacement (Å) to ASE Counterpart")
+ax3.set_xlabel("Structure")
+ax3.set_title(
+    "Mean Displacement of Torch-Sim Methods to ASE Counterparts (per Structure)"
+)
 ax3.set_xticks(x_fig3)
 ax3.set_xticklabels(structure_names, rotation=45, ha="right")
-ax3.legend(title="Comparison Pair", bbox_to_anchor=(1.02, 1), loc='upper left') # Adjusted legend
-ax3.grid(True, axis='y', linestyle='--', alpha=0.7)
-plt.tight_layout(rect=[0, 0, 0.83, 1]) # Fine-tune rect for legend
+ax3.legend(
+    title="Comparison Pair", bbox_to_anchor=(1.02, 1), loc="upper left"
+)  # Adjusted legend
+ax3.grid(True, axis="y", linestyle="--", alpha=0.7)
+plt.tight_layout(rect=[0, 0, 0.83, 1])  # Fine-tune rect for legend
 
 
 plt.show()
