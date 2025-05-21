@@ -1524,7 +1524,6 @@ def _ase_fire_step(  # noqa: C901, PLR0915
         dr_cell = cell_dt * state.cell_velocities
 
     # 6. Clamp to max_step
-    # Atoms
     dr_norm_atom = torch.norm(dr_atom, dim=1, keepdim=True)
     mask_atom_max_step = dr_norm_atom > max_step
     dr_atom = torch.where(
