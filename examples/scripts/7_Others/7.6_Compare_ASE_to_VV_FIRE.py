@@ -5,6 +5,7 @@ Comparing the ASE and VV FIRE optimizers.
 # /// script
 # dependencies = [
 #     "mace-torch>=0.3.12",
+#     "plotly>=6.0.0",
 # ]
 # ///
 
@@ -49,6 +50,9 @@ ase_max_optimizer_steps = max_iterations * 10
 
 # Set random seed for reproducibility
 rng = np.random.default_rng(seed=0)
+torch.manual_seed(0)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(0)
 
 # Create diamond cubic Silicon
 si_dc = bulk("Si", "diamond", a=5.21, cubic=True).repeat(supercell_scale)
@@ -120,7 +124,7 @@ state = ts.io.atoms_to_state(atoms_list, device=device, dtype=dtype)
 initial_energies = model(state)["energy"]
 
 
-def run_optimization_ts(
+def run_optimization_ts(  # noqa: PLR0915
     *,
     initial_state: SimState,
     ts_md_flavor: Literal["vv_fire", "ase_fire"],
@@ -141,25 +145,24 @@ def run_optimization_ts(
         ase_cell_k = Cell(cell_tensor_k)
         params_str = ", ".join([f"{p:.2f}" for p in ase_cell_k.cellpar()])
         print(
-            f"  Structure {k_idx + 1}: Volume={ase_cell_k.volume:.2f} Å³, Params=[{params_str}]"
+            f"  Structure {k_idx + 1}: Volume={ase_cell_k.volume:.2f} Å³, "
+            f"Params=[{params_str}]"
         )
 
     if ts_use_frechet:
-        # Uses frechet_cell_fire for combined cell and position optimization
         init_fn_opt, update_fn_opt = frechet_cell_fire(
             model=model, md_flavor=ts_md_flavor
         )
     else:
-        # Uses fire for position-only optimization
         init_fn_opt, update_fn_opt = fire(model=model, md_flavor=ts_md_flavor)
 
     opt_state = init_fn_opt(initial_state.clone())
 
     batcher = ts.InFlightAutoBatcher(
-        model=model,  # The MaceModel wrapper
+        model=model,
         memory_scales_with="n_atoms",
         max_memory_scaler=1000,
-        max_iterations=max_iterations_ts,  # Use the passed max_iterations
+        max_iterations=max_iterations_ts,
         return_indices=True,
     )
     batcher.load_states(opt_state)
@@ -229,11 +232,13 @@ def run_optimization_ts(
             ase_cell_k = Cell(cell_tensor_k)
             params_str = ", ".join([f"{p:.2f}" for p in ase_cell_k.cellpar()])
             print(
-                f"  Structure {k_idx + 1}: Volume={ase_cell_k.volume:.2f} Å³, Params=[{params_str}]"
+                f"  Structure {k_idx + 1}: Volume={ase_cell_k.volume:.2f} Å³, "
+                f"Params=[{params_str}]"
             )
     else:
         print(
-            "Final cell parameters (Torch-Sim): Not available (final_state_concatenated is None or has no cell)."
+            "Final cell parameters (Torch-Sim): Not available (final_state_concatenated "
+            "is None or has no cell)."
         )
 
     end_time = time.perf_counter()
@@ -244,7 +249,7 @@ def run_optimization_ts(
     return convergence_steps, final_state_concatenated
 
 
-def run_optimization_ase(
+def run_optimization_ase(  # noqa: C901, PLR0915
     *,
     initial_state: SimState,
     ase_use_frechet_filter: bool,
@@ -270,7 +275,9 @@ def run_optimization_ase(
         initial_cell_ase = ase_atoms_orig.get_cell()
         initial_params_str = ", ".join([f"{p:.2f}" for p in initial_cell_ase.cellpar()])
         print(
-            f"  Initial cell (ASE Structure {i + 1}): Volume={initial_cell_ase.volume:.2f} Å³, Params=[{initial_params_str}]"
+            f"  Initial cell (ASE Structure {i + 1}): "
+            f"Volume={initial_cell_ase.volume:.2f} Å³, "
+            f"Params=[{initial_params_str}]"
         )
 
         ase_calc_instance = mace_mp_calculator_for_ase(
@@ -288,7 +295,7 @@ def run_optimization_ase(
         dyn = ASEFIRE(optim_target_atoms, trajectory=None, logfile=None)
 
         try:
-            dyn.run(fmax=force_tol, steps=max_steps_ase)  # Use passed max_steps_ase
+            dyn.run(fmax=force_tol, steps=max_steps_ase)
             if dyn.converged():
                 convergence_steps_list.append(dyn.nsteps)
                 print(f"ASE structure {i + 1} converged in {dyn.nsteps} steps.")
@@ -298,7 +305,7 @@ def run_optimization_ase(
                     f"{max_steps_ase} steps. Steps taken: {dyn.nsteps}."
                 )
                 convergence_steps_list.append(-1)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             print(f"ASE optimization failed for structure {i + 1}: {e}")
             convergence_steps_list.append(-1)
 
@@ -308,15 +315,12 @@ def run_optimization_ase(
         final_cell_ase = final_ats_for_print.get_cell()
         final_params_str = ", ".join([f"{p:.2f}" for p in final_cell_ase.cellpar()])
         print(
-            f"  Final cell (ASE Structure {i + 1}): Volume={final_cell_ase.volume:.2f} Å³, Params=[{final_params_str}]"
+            f"  Final cell (ASE Structure {i + 1}): "
+            f"Volume={final_cell_ase.volume:.2f} Å³, "
+            f"Params=[{final_params_str}]"
         )
 
         final_ase_atoms_list.append(final_ats_for_print)
-
-    # Convert list of final ASE atoms objects back to a base SimState first
-    # to easily get positions, cell, etc.
-    # However, ts.io.atoms_to_state might not preserve all attributes needed for GDState directly.
-    # It's better to extract all required components directly from final_ase_atoms_list.
 
     all_positions = []
     all_masses = []
@@ -324,7 +328,7 @@ def run_optimization_ase(
     all_cells = []
     all_batches_for_gd = []
     final_energies_ase = []
-    final_forces_ase_tensors = []  # List to store force tensors
+    final_forces_ase_tensors = []
 
     current_atom_offset = 0
     for batch_idx, ats_final in enumerate(final_ase_atoms_list):
@@ -353,7 +357,8 @@ def run_optimization_ase(
         try:
             if ats_final.calc is None:
                 print(
-                    f"Re-attaching ASE calculator for final energy/forces for structure {batch_idx}."
+                    "Re-attaching ASE calculator for final energy/forces for "
+                    f"structure {batch_idx}."
                 )
                 temp_calc = mace_mp_calculator_for_ase(
                     model=MaceUrls.mace_mpa_medium,
@@ -365,20 +370,14 @@ def run_optimization_ase(
             final_forces_ase_tensors.append(
                 torch.tensor(ats_final.get_forces(), device=device, dtype=dtype)
             )
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             print(
                 f"Could not get final energy/forces for an ASE structure {batch_idx}: {e}"
             )
             final_energies_ase.append(float("nan"))
-            # Append a zero tensor of appropriate shape if forces fail, or handle error
-            # For GDState, forces are required. If any structure fails, GDState creation might fail.
-            # We need to ensure all_positions, etc. are also correctly populated even on failure.
-            # For now, let's assume if energy fails, forces might also, and GDState might be problematic.
-            # A robust solution would be to skip failed structures or return None.
-            # For now, let's make forces a zero tensor of expected shape if it fails.
             if all_positions and len(all_positions[-1]) > 0:
                 final_forces_ase_tensors.append(torch.zeros_like(all_positions[-1]))
-            else:  # Cannot determine shape, this path is problematic
+            else:
                 final_forces_ase_tensors.append(
                     torch.empty((0, 3), device=device, dtype=dtype)
                 )
@@ -400,18 +399,16 @@ def run_optimization_ase(
     # Check for NaN energies which might cause issues
     if torch.isnan(concatenated_energies).any():
         print(
-            "Warning: NaN values found in final ASE energies. GDState energy tensor will contain NaNs."
+            "Warning: NaN values found in final ASE energies. "
+            "GDState energy tensor will contain NaNs."
         )
-        # Consider replacing NaNs if GDState or subsequent ops can't handle them:
-        # concatenated_energies = torch.nan_to_num(concatenated_energies, nan=0.0) # Example replacement
 
     # Create GDState instance
-    # pbc is global, taken from initial_state
     final_state_as_gd = GDState(
         positions=concatenated_positions,
         masses=concatenated_masses,
         cell=concatenated_cells,
-        pbc=initial_state.pbc,  # Assuming pbc is constant and global
+        pbc=initial_state.pbc,
         atomic_numbers=concatenated_atomic_numbers,
         batch=concatenated_batch_indices,
         energy=concatenated_energies,
@@ -460,7 +457,7 @@ configs_to_run = [
         "ts_use_frechet": True,
     },
     {
-        "name": "ASE FIRE (Native, PosOnly)",  # Corrected name: Only optimizes positions without a cell filter
+        "name": "ASE FIRE (Native, PosOnly)",
         "type": "ase",
         "ase_use_frechet_filter": False,
     },
@@ -475,9 +472,7 @@ all_results = {}
 
 for config_run in configs_to_run:
     print(f"\n\nStarting configuration: {config_run['name']}")
-    # Get relevant params, providing defaults where necessary for the run_optimization call
     optimizer_type_val = config_run["type"]
-    # Will be None for ASE type, handled by assert
     ts_md_flavor_val = config_run.get("ts_md_flavor")
     ts_use_frechet_val = config_run.get("ts_use_frechet", False)
     ase_use_frechet_filter_val = config_run.get("ase_use_frechet_filter", False)
@@ -488,18 +483,18 @@ for config_run in configs_to_run:
     if optimizer_type_val == "torch_sim":
         assert ts_md_flavor_val is not None, "ts_md_flavor must be provided for torch_sim"
         steps, final_state_opt = run_optimization_ts(
-            initial_state=state.clone(),  # Use a fresh clone for each run
+            initial_state=state.clone(),
             ts_md_flavor=ts_md_flavor_val,
             ts_use_frechet=ts_use_frechet_val,
             force_tol=force_tol,
-            max_iterations_ts=max_iterations,  # Pass the global max_iterations
+            max_iterations_ts=max_iterations,
         )
     elif optimizer_type_val == "ase":
         steps, final_state_opt = run_optimization_ase(
-            initial_state=state.clone(),  # Use a fresh clone for each run
+            initial_state=state.clone(),
             ase_use_frechet_filter=ase_use_frechet_filter_val,
             force_tol=force_tol,
-            max_steps_ase=ase_max_optimizer_steps,  # Pass the global ase_max_optimizer_steps
+            max_steps_ase=ase_max_optimizer_steps,
         )
     else:
         raise ValueError(f"Unknown optimizer_type: {optimizer_type_val}")
@@ -530,7 +525,6 @@ for name, result_data in all_results.items():
     if not_converged_indices:
         print(f"  Did not converge for structure indices: {not_converged_indices}")
 
-# Mean Displacement Comparisons
 comparison_pairs = [
     ("torch-sim ASE-FIRE (PosOnly)", "ASE FIRE (Native, PosOnly)"),
     ("torch-sim ASE-FIRE (Frechet Cell)", "ASE FIRE (Native Frechet Filter, CellOpt)"),
@@ -559,14 +553,15 @@ for name1, name2 in comparison_pairs:
 
         mean_displacements = []
         for s1, s2 in zip(state1_list, state2_list, strict=True):
-            if s1.n_atoms == 0 or s2.n_atoms == 0:  # Handle empty states if they occur
+            if s1.n_atoms == 0 or s2.n_atoms == 0:
                 mean_displacements.append(float("nan"))
                 continue
             pos1_centered = s1.positions - s1.positions.mean(dim=0, keepdim=True)
             pos2_centered = s2.positions - s2.positions.mean(dim=0, keepdim=True)
             if pos1_centered.shape != pos2_centered.shape:
                 print(
-                    f"Warning: Shape mismatch for {name1} vs {name2} in structure. Skipping displacement calc."
+                    f"Warning: Shape mismatch for {name1} vs {name2} in structure. "
+                    "Skipping displacement calc."
                 )
                 mean_displacements.append(float("nan"))
                 continue
@@ -575,19 +570,18 @@ for name1, name2 in comparison_pairs:
             mean_displacements.append(mean_disp)
 
         print(
-            f"\nMean Disp ({name1} vs {name2}): {[f'{d:.4f}' for d in mean_displacements]} Å"
+            f"\nMean Disp ({name1} vs {name2}): "
+            f"{[f'{d:.4f}' for d in mean_displacements]} Å"
         )
     else:
         print(
-            f"\nSkipping displacement comparison for ({name1} vs {name2}), one or both results missing."
+            f"\nSkipping displacement comparison for ({name1} vs {name2}), "
+            "one or both results missing."
         )
 
 
 # --- Plotting Results ---
-
-# Names for the structures for plotting labels
 original_structure_formulas = [ats.get_chemical_formula() for ats in atoms_list]
-# Make them more concise if needed:
 structure_names = [
     "Si_bulk",
     "Cu_bulk",
@@ -595,7 +589,7 @@ structure_names = [
     "Si_vac",
     "Cu_vac",
     "Fe_vac",
-]  # Updated for 6 structures
+]
 if len(structure_names) != len(atoms_list):
     print(
         f"Warning: Mismatch between custom structure_names ({len(structure_names)}) and "
@@ -607,13 +601,11 @@ num_structures_plot = len(structure_names)
 # --- Plot 1: Convergence Steps (Multi-bar per structure) ---
 plot_methods_fig1 = list(all_results)
 num_methods_fig1 = len(plot_methods_fig1)
-# Initialize with NaNs, so if a method fails completely, its bars are missing or clearly marked
 steps_data_fig1 = np.full((num_structures_plot, num_methods_fig1), np.nan)
 
 for method_idx, method_name in enumerate(plot_methods_fig1):
     result_data = all_results[method_name]
     if result_data["final_state"] is None or result_data["steps"] is None:
-        # steps_data_fig1[:, method_idx] = np.nan # Already initialized with NaN
         print(f"Plot1: Skipping steps for {method_name} as final_state or steps is None.")
         continue
 
@@ -625,22 +617,25 @@ for method_idx, method_name in enumerate(plot_methods_fig1):
         steps_data_fig1[:, method_idx] = steps_plot_values
     elif len(steps_plot_values) > num_structures_plot:
         print(
-            f"Warning: More step values ({len(steps_plot_values)}) than structure names ({num_structures_plot}) for {method_name}. Truncating."
+            f"Warning: More step values ({len(steps_plot_values)}) than "
+            f"structure names ({num_structures_plot}) for {method_name}. "
+            "Truncating."
         )
         steps_data_fig1[:, method_idx] = steps_plot_values[:num_structures_plot]
     elif len(steps_plot_values) < num_structures_plot:
         print(
-            f"Warning: Fewer step values ({len(steps_plot_values)}) than structure names ({num_structures_plot}) for {method_name}. Padding with NaN."
+            f"Warning: Fewer step values ({len(steps_plot_values)}) than "
+            f"structure names ({num_structures_plot}) for {method_name}. "
+            "Padding with NaN."
         )
         steps_data_fig1[: len(steps_plot_values), method_idx] = steps_plot_values
-        # The rest will remain NaN due to initialization
 
 fig1_plotly = go.Figure()
 
 for i in range(num_methods_fig1):
     fig1_plotly.add_bar(
         name=plot_methods_fig1[i],
-        x=structure_names,  # x-axis is structure names
+        x=structure_names,
         y=steps_data_fig1[:, i],
         text=[
             "NC"
@@ -664,9 +659,7 @@ fig1_plotly.update_layout(
     yaxis_gridcolor="lightgrey",
     plot_bgcolor="white",
     height=600,
-    width=max(
-        1000, 150 * num_structures_plot
-    ),  # Adjust width based on number of structures
+    width=max(1000, 150 * num_structures_plot),
     margin=dict(l=50, r=50, b=100, t=50, pad=4),
     legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
 )
@@ -686,11 +679,10 @@ for name, result_data in all_results.items():
     if result_data["final_state"] is None or result_data["final_state"].energy is None:
         print(f"Plot2: Skipping energy diff for {name} as final_state or energy is None.")
         if name not in plot_names_fig2:
-            plot_names_fig2.append(name)  # Keep name for consistent bar count
-        avg_energy_diffs_fig2.append(np.nan)  # Add NaN if data missing
+            plot_names_fig2.append(name)
+        avg_energy_diffs_fig2.append(np.nan)
         continue
 
-    # Ensure name is added if not already by a skip
     if name not in plot_names_fig2:
         plot_names_fig2.append(name)
 
@@ -744,17 +736,13 @@ for name, result_data in all_results.items():
         n
         for n, v in zip(plot_names_fig2, avg_energy_diffs_fig2, strict=False)
         if not np.isnan(v)
-    ]:  # Handle cases not covered
+    ]:
         print(f"Plot2: Fallback for {name}, setting energy diff to NaN.")
         avg_energy_diffs_fig2.append(np.nan)
 
-
-# Ensure plot_names_fig2 and avg_energy_diffs_fig2 have the same length
-# This can happen if a name was added to plot_names_fig2 but its energy_diff calculation failed or was skipped.
-# A more robust way is to build them in parallel.
 final_plot_names_fig2 = []
 final_avg_energy_diffs_fig2 = []
-all_method_names_sorted = sorted(all_results)  # Use a fixed order
+all_method_names_sorted = sorted(all_results)
 
 for name in all_method_names_sorted:
     result_data = all_results[name]
@@ -764,7 +752,7 @@ for name in all_method_names_sorted:
         continue
 
     current_energies = result_data["final_state"].energy.cpu().numpy()
-    energy_to_append = np.nan  # Default to NaN
+    energy_to_append = np.nan
 
     if name in (baseline_ase_pos_only, baseline_ase_frechet):
         energy_to_append = 0.0
@@ -808,7 +796,7 @@ fig2_plotly.add_bar(
         f"{yval:.3f}" if not np.isnan(yval) else ""
         for yval in final_avg_energy_diffs_fig2
     ],
-    textposition="auto",  # Let Plotly decide best position, or use 'outside'/'inside'
+    textposition="auto",
     textfont=dict(size=10),
 )
 
@@ -824,12 +812,13 @@ fig2_plotly.update_layout(
     shapes=[dict(type="line", y0=0, y1=0, x0=-0.5, x1=x1, line=line_dict)],
     height=600,
     width=max(800, 100 * len(final_plot_names_fig2)),
-    margin=dict(l=50, r=50, b=150, t=50, pad=4),  # Increased bottom margin for labels
+    margin=dict(l=50, r=50, b=150, t=50, pad=4),
 )
 
 
 # --- Plot 3: Mean Displacement from ASE Counterparts (Multi-bar per structure) ---
-comparison_pairs_plot3_defs = [  # (ts_method_name, ase_method_name, short_label_for_legend)
+# look at sets of: (ts_method_name, ase_method_name, short_label_for_legend)
+comparison_pairs_plot3_defs = [
     (
         "torch-sim ASE-FIRE (PosOnly)",
         baseline_ase_pos_only,
@@ -893,17 +882,15 @@ for pair_idx, (ts_method_name, ase_method_name, plot_label) in enumerate(
 
         if len(mean_displacements_for_this_pair) == num_structures_plot:
             disp_data_fig3[:, pair_idx] = np.array(mean_displacements_for_this_pair)
-        else:  # Should not happen if previous checks pass
+        else:
             print(f"Plot3: Inner loop displacement calculation mismatch for {plot_label}")
 
     else:
         print(f"Plot3: Missing data for methods in pair: {plot_label}.")
-        # Data remains NaN
 
 fig3_plotly = go.Figure()
 
 for idx, name in enumerate(legend_labels_fig3):
-    # x-axis is structure names
     fig3_plotly.add_bar(name=name, x=structure_names, y=disp_data_fig3[:, idx])
 
 
@@ -922,7 +909,6 @@ fig3_plotly.update_layout(
     margin=dict(l=50, r=50, b=100, t=50, pad=4),
     legend=dict(orientation="h", yanchor="bottom", y=0.96, xanchor="right", x=1),
 )
-
 
 # Show Plotly figures
 fig1_plotly.show()
